@@ -85,7 +85,6 @@ import torch.distributed as dist
 import triton
 from packaging import version as pkg_version
 from PIL import Image
-from starlette.routing import Mount
 from torch import nn
 from torch.library import Library
 from torch.utils._contextlib import _DecoratorContextManager
@@ -1547,17 +1546,192 @@ def set_prometheus_multiproc_dir():
     logger.debug(f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")
 
 
+_PROMETHEUS_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+def _get_positive_float_env(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r, using %s", name, value, default)
+        return default
+    if parsed <= 0:
+        logger.warning("Invalid %s=%r, using %s", name, value, default)
+        return default
+    return parsed
+
+
+def _generate_prometheus_latest_in_subprocess(
+    prometheus_multiproc_dir_name: str,
+    timeout: float,
+) -> Tuple[bytes, str]:
+    script = """
+from prometheus_client import CollectorRegistry, multiprocess
+from prometheus_client.exposition import generate_latest
+registry = CollectorRegistry()
+multiprocess.MultiProcessCollector(registry)
+import sys
+sys.stdout.buffer.write(generate_latest(registry))
+"""
+    env = os.environ.copy()
+    env["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir_name
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Prometheus metrics subprocess failed: "
+            f"{result.stderr.decode('utf-8', errors='replace')}"
+        )
+    return result.stdout, _PROMETHEUS_CONTENT_TYPE
+
+
+class _PrometheusMetricsSnapshotter:
+    def __init__(
+        self,
+        prometheus_multiproc_dir_name: str,
+        refresh_interval_seconds: float,
+        max_staleness_seconds: float,
+        generation_timeout_seconds: float,
+        generator: Callable[[str, float], Tuple[bytes, str]],
+    ):
+        self.prometheus_multiproc_dir_name = prometheus_multiproc_dir_name
+        self.refresh_interval_seconds = refresh_interval_seconds
+        self.max_staleness_seconds = max_staleness_seconds
+        self.generation_timeout_seconds = generation_timeout_seconds
+        self.generator = generator
+
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._content: Optional[bytes] = None
+        self._content_type = _PROMETHEUS_CONTENT_TYPE
+        self._updated_at_monotonic = 0.0
+        self._last_error: Optional[str] = None
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="prometheus-metrics-snapshotter",
+        )
+        self._thread.start()
+
+    def close(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            self.refresh_once()
+            self._stop_event.wait(self.refresh_interval_seconds)
+
+    def refresh_once(self):
+        try:
+            content, content_type = self.generator(
+                self.prometheus_multiproc_dir_name,
+                self.generation_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            logger.warning("Timed out generating Prometheus metrics snapshot")
+            self._store_error("Timed out generating metrics snapshot")
+        except Exception as exc:
+            logger.exception("Failed to generate Prometheus metrics snapshot")
+            self._store_error(str(exc) or exc.__class__.__name__)
+        else:
+            with self._lock:
+                self._content = content
+                self._content_type = content_type
+                self._updated_at_monotonic = time.monotonic()
+                self._last_error = None
+
+    def _store_error(self, error: str):
+        with self._lock:
+            self._last_error = error
+
+    def get_snapshot(self) -> Tuple[Optional[bytes], str, float, Optional[str]]:
+        with self._lock:
+            content = self._content
+            content_type = self._content_type
+            updated_at = self._updated_at_monotonic
+            last_error = self._last_error
+
+        if content is None:
+            return None, content_type, math.inf, last_error
+
+        age_seconds = time.monotonic() - updated_at
+        if age_seconds > self.max_staleness_seconds:
+            return (
+                None,
+                content_type,
+                age_seconds,
+                f"metrics snapshot is stale: {age_seconds:.3f}s",
+            )
+
+        return content, content_type, age_seconds, last_error
+
+
 def add_prometheus_middleware(app):
     # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-    from prometheus_client import CollectorRegistry, make_asgi_app, multiprocess
+    from starlette.responses import Response
+    from starlette.routing import Route
 
-    registry = CollectorRegistry()
-    multiprocess.MultiProcessCollector(registry)
-    metrics_route = Mount("/metrics", make_asgi_app(registry=registry))
+    prometheus_multiproc_dir_name = os.environ["PROMETHEUS_MULTIPROC_DIR"]
+    snapshotter = _PrometheusMetricsSnapshotter(
+        prometheus_multiproc_dir_name=prometheus_multiproc_dir_name,
+        refresh_interval_seconds=_get_positive_float_env(
+            "SGLANG_PROMETHEUS_SNAPSHOT_REFRESH_INTERVAL_SECONDS", 5.0
+        ),
+        max_staleness_seconds=_get_positive_float_env(
+            "SGLANG_PROMETHEUS_SNAPSHOT_MAX_STALENESS_SECONDS", 30.0
+        ),
+        generation_timeout_seconds=_get_positive_float_env(
+            "SGLANG_PROMETHEUS_SNAPSHOT_GENERATION_TIMEOUT_SECONDS", 8.0
+        ),
+        generator=_generate_prometheus_latest_in_subprocess,
+    )
+    snapshotter.start()
+    app.state.prometheus_metrics_snapshotter = snapshotter
 
-    # Workaround for 307 Redirect for /metrics
-    metrics_route.path_regex = re.compile("^/metrics(?P<path>.*)$")
-    app.routes.append(metrics_route)
+    async def shutdown_metrics_snapshotter():
+        snapshotter.close()
+
+    if hasattr(app, "add_event_handler"):
+        app.add_event_handler("shutdown", shutdown_metrics_snapshotter)
+
+    async def metrics_endpoint(request):
+        content, content_type, age_seconds, error = snapshotter.get_snapshot()
+        if content is None:
+            message = b"metrics snapshot unavailable\n"
+            if error is not None:
+                message = f"{error}\n".encode("utf-8", errors="replace")
+            return Response(
+                content=message,
+                status_code=503,
+                media_type="text/plain",
+            )
+
+        return Response(
+            content=content,
+            headers={
+                "Content-Type": content_type,
+                "X-SGLang-Metrics-Snapshot-Age-Seconds": f"{age_seconds:.3f}",
+            },
+        )
+
+    app.routes.append(Route("/metrics", metrics_endpoint, methods=["GET"]))
+    app.routes.append(Route("/metrics/", metrics_endpoint, methods=["GET"]))
 
 
 class RefCountedGauge:
