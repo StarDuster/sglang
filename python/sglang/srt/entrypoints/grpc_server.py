@@ -5,22 +5,32 @@ A lightweight HTTP sidecar is started alongside the gRPC server to expose:
 - /metrics (Prometheus, when --enable-metrics is set)
 - /start_profile, /stop_profile (profiling control)
 
-The sidecar is started on --grpc-http-sidecar-port (default: --port + 1)
-once the gRPC request manager is ready, regardless of whether --enable-metrics
-is set.
+On rank 0, the sidecar is started on --grpc-http-sidecar-port (default:
+--port + 1) once the gRPC request manager is ready, regardless of whether
+--enable-metrics is set. On non-rank0 multi-node workers, only metrics routes
+can be exposed because those workers do not own the gRPC request manager.
 """
 
+import asyncio
 import inspect
 import json
 import logging
+import signal
 import time
+from contextlib import suppress
 
 from aiohttp import web
 
-from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 from sglang.srt.utils.common import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+
+def _is_multinode_grpc_worker(server_args) -> bool:
+    return (
+        getattr(server_args, "nnodes", 1) > 1
+        and getattr(server_args, "node_rank", 0) != 0
+    )
 
 
 async def _start_sidecar_server(host: str, port: int, app):
@@ -82,6 +92,7 @@ def _add_admin_routes(app, request_manager):
     Business logic (request construction, env var handling, response interpretation)
     lives here; request_manager only provides the transport to the scheduler.
     """
+    from sglang.srt.managers.io_struct import ProfileReq, ProfileReqType
 
     async def start_profile_handler(request):
         try:
@@ -153,6 +164,104 @@ def _add_admin_routes(app, request_manager):
     app.router.add_post("/stop_profile", stop_profile_handler)
 
 
+async def _wait_for_scheduler_processes(scheduler_procs):
+    shutdown_event = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    def request_shutdown():
+        logger.info("Received shutdown signal")
+        shutdown_event.set()
+
+    installed_signal_handlers = []
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, request_shutdown)
+            installed_signal_handlers.append(sig)
+        except (NotImplementedError, RuntimeError):
+            # Signal handlers can only be installed from the main thread.
+            # If this is not the main thread, the process-level handler
+            # already installed by the embedding runtime remains in charge.
+            pass
+
+    try:
+        while not shutdown_event.is_set():
+            dead_procs = [proc for proc in scheduler_procs if not proc.is_alive()]
+            if dead_procs:
+                exit_codes = ", ".join(str(proc.exitcode) for proc in dead_procs)
+                raise RuntimeError(
+                    "Scheduler process exited unexpectedly on gRPC worker node "
+                    f"(exit codes: {exit_codes})"
+                )
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(shutdown_event.wait(), timeout=1.0)
+    finally:
+        for sig in installed_signal_handlers:
+            loop.remove_signal_handler(sig)
+
+        for proc in scheduler_procs:
+            if proc.is_alive():
+                proc.terminate()
+        for proc in scheduler_procs:
+            proc.join(timeout=2.0)
+            if proc.is_alive():
+                proc.kill()
+
+
+async def _serve_grpc_worker_node(server_args, sidecar_app, sidecar_port: int):
+    """Run only scheduler processes on non-rank0 multi-node gRPC workers."""
+    bootstrap_server = None
+    if server_args.disaggregation_mode == "prefill":
+        from sglang.srt.managers.disagg_service import start_disagg_service
+
+        bootstrap_server = start_disagg_service(server_args)
+        if bootstrap_server:
+            logger.info(
+                "Bootstrap server started for disaggregation mode on %s:%s",
+                server_args.host,
+                server_args.disaggregation_bootstrap_port,
+            )
+
+    from smg_grpc_servicer.sglang.scheduler_launcher import (
+        launch_scheduler_process_only,
+    )
+
+    _scheduler_info, _port_args, scheduler_procs = launch_scheduler_process_only(
+        server_args=server_args,
+    )
+
+    sidecar_runner = None
+    if len(list(sidecar_app.router.routes())) > 0:
+        try:
+            sidecar_runner = await _start_sidecar_server(
+                server_args.host, sidecar_port, sidecar_app
+            )
+        except OSError as e:
+            logger.error(
+                "Failed to start HTTP sidecar server on gRPC worker node: %s. "
+                "Continuing without metrics endpoints.",
+                e,
+                exc_info=True,
+            )
+        except Exception as e:
+            logger.error(
+                "Unexpected error starting HTTP sidecar server on gRPC worker "
+                "node: %s. Continuing without metrics endpoints.",
+                e,
+                exc_info=True,
+            )
+
+    logger.info(
+        "gRPC frontend disabled on multi-node worker node_rank=%s; "
+        "rank 0 owns the request manager and public gRPC server.",
+        server_args.node_rank,
+    )
+    try:
+        await _wait_for_scheduler_processes(scheduler_procs)
+    finally:
+        if sidecar_runner is not None:
+            await sidecar_runner.cleanup()
+
+
 async def serve_grpc(server_args, model_info=None):
     """Start the standalone gRPC server with integrated scheduler."""
     try:
@@ -220,6 +329,10 @@ async def serve_grpc(server_args, model_info=None):
                 e,
                 exc_info=True,
             )
+
+    if _is_multinode_grpc_worker(server_args):
+        await _serve_grpc_worker_node(server_args, sidecar_app, sidecar_port)
+        return
 
     # Older smg-grpc-servicer releases (≤ 0.5.2) accept only (server_args,
     # model_info) and reject the on_request_manager_ready hook. The hook is
