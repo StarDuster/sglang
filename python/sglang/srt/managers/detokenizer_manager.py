@@ -358,14 +358,14 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                     s.append_decoded_text(new_text)
                     s.surr_offset = s.read_offset
                     s.read_offset = len(s.decode_ids)
-                    s.sent_offset = s.decoded_text_len
+                    s.sent_offset = s.decoded_text_len + max(pending - len(new_text), 0)
                     output_strs.append(new_text[pending:] if pending else new_text)
                 else:
                     # Incomplete UTF-8: emit the printable prefix only; do not
                     # commit (token offsets stay so the next iteration retries
                     # with more tokens).
                     printable = find_printable_text(new_text)
-                    s.sent_offset = s.decoded_text_len + len(printable)
+                    s.sent_offset = s.decoded_text_len + max(pending, len(printable))
                     output_strs.append(printable[pending:] if pending else printable)
                 continue
 
