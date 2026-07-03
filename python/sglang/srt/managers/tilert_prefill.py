@@ -64,6 +64,7 @@ def stage_prefill_kv(scheduler: Scheduler, token_ids: List[int], out_path: str) 
     if scheduler.ps.tp_rank != 0:
         return
 
+    from sglang.srt.layers.attention.dsa import dsa_indexer
     from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
     from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -116,7 +117,14 @@ def stage_prefill_kv(scheduler: Scheduler, token_ids: List[int], out_path: str) 
         ki = k_fp8.view(torch.float8_e4m3fn).to(
             torch.float32
         ) * k_scale.contiguous().view(torch.float32)
-        ki_all[i].copy_(ki.to(torch.bfloat16))
+        ki = ki.to(torch.bfloat16)
+        # TileRT's ki cache holds Hadamard-rotated indexer keys. SGLang's
+        # fused indexer path stores them unrotated (the rotation is
+        # logit-preserving and dropped inside the fused kernel), so rotate
+        # here to match; the non-fused path already stores rotated keys.
+        if dsa_indexer._use_dsa_indexer_fusion:
+            ki = dsa_indexer.rotate_activation(ki)
+        ki_all[i].copy_(ki)
 
     tmp_path = f"{out_path}.tmp"
     torch.save(
