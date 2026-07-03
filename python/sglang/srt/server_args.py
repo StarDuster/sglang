@@ -558,9 +558,11 @@ class ServerArgs:
             "SGLang accounts this fraction against TOTAL GPU memory, "
             "including what TileRT (weights + preallocated KV) already "
             "holds, so it must be high: TileRT-resident + prefill weights "
-            "+ prefill KV, e.g. ~0.85 for GLM-5.1 on 288GB B300s."
+            "+ prefill KV, e.g. ~0.88 for GLM-5.1 on 288GB B300s. The "
+            "leftover after weights sizes the prefill KV pool and thus the "
+            "longest prompt that can be fully externally prefilled."
         ),
-    ] = 0.85
+    ] = 0.88
     tilert_prefill_staging_dir: A[
         Optional[str],
         (

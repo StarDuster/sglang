@@ -196,6 +196,17 @@ class TileRTPrefillWorker:
             self._ready.set()
             return
 
+        # KV-pool ceiling of the nested engine; prompts beyond it are
+        # externally prefilled up to the cap and finished by TileRT's
+        # internal prefill (partial injection).
+        self.max_prefill_tokens = int(
+            getattr(self._engine.tokenizer_manager, "max_req_input_len", 0) or 0
+        )
+        logger.info(
+            "TileRT prefill engine ready. max_prefill_tokens=%s "
+            "(prompts beyond this are partially injected)",
+            self.max_prefill_tokens,
+        )
         self._ready.set()
         while True:
             job = self._jobs.get()
@@ -211,6 +222,19 @@ class TileRTPrefillWorker:
                 done.set()
 
     def _prefill_on_thread(self, token_ids: List[int]) -> Tuple[int, LayerCaches]:
+        if 0 < self.max_prefill_tokens < len(token_ids):
+            # Cap to the nested engine's KV pool; page-align so the radix
+            # match covers the whole capped prefix. The uncached tail runs
+            # through TileRT internal prefill after injection.
+            cap = (self.max_prefill_tokens - 8) // 64 * 64
+            logger.info(
+                "Prompt (%s tokens) exceeds prefill engine capacity (%s); "
+                "externally prefilling first %s tokens",
+                len(token_ids),
+                self.max_prefill_tokens,
+                cap,
+            )
+            token_ids = token_ids[:cap]
         self._engine.generate(
             input_ids=token_ids,
             sampling_params={"max_new_tokens": 1, "temperature": 0.0},
