@@ -502,12 +502,69 @@ class ServerArgs:
                 "and fall back to the Transformers implementation if no SGLang "
                 "implementation is available.\n"
                 '* "sglang" will use the SGLang model implementation.\n'
-                '* "transformers" will use the Transformers model '
-                '* "mindspore" will use the MindSpore model '
-                "implementation.\n"
+                '* "transformers" will use the Transformers model implementation.\n'
+                '* "mindspore" will use the MindSpore model implementation.\n'
+                '* "tilert" will use TileRT as a native single-request '
+                "generation engine behind SGLang serving APIs.\n"
             )
         ),
     ] = "auto"
+    tilert_model_type: A[
+        str,
+        Arg(
+            help="TileRT model type to load when --model-impl=tilert.",
+            choices=["glm5"],
+        ),
+    ] = "glm5"
+    tilert_model_weights_dir: A[
+        Optional[str],
+        "TileRT weights directory. Defaults to --model-path when omitted.",
+    ] = None
+    tilert_repo_path: A[
+        Optional[str],
+        "Optional TileRT source checkout path to prepend to PYTHONPATH before importing tilert.",
+    ] = None
+    tilert_disable_mtp: A[
+        bool,
+        "Disable TileRT MTP. MTP is enabled by default for the TileRT backend.",
+    ] = False
+    tilert_enable_thinking: A[
+        bool,
+        "Enable thinking mode when TileRT applies its chat template.",
+    ] = False
+    tilert_external_prefill: A[
+        bool,
+        (
+            "Run prompt prefill on a nested SGLang engine and inject the KV "
+            "cache into TileRT, instead of TileRT's slow 4-token chunked "
+            "prefill. Requires --model-impl=tilert."
+        ),
+    ] = False
+    tilert_prefill_min_tokens: A[
+        int,
+        (
+            "Minimum prompt length (tokens) to route through the external "
+            "prefill engine; shorter prompts use TileRT internal prefill."
+        ),
+    ] = 1024
+    tilert_prefill_tp_size: A[
+        int,
+        "Tensor parallel size of the nested TileRT prefill engine.",
+    ] = 8
+    tilert_prefill_mem_fraction: A[
+        float,
+        (
+            "mem_fraction_static for the nested TileRT prefill engine. It "
+            "shares GPUs with TileRT, so keep this small."
+        ),
+    ] = 0.3
+    tilert_prefill_staging_dir: A[
+        Optional[str],
+        (
+            "Directory used to stage extracted KV between the prefill engine "
+            "and TileRT. Defaults to /dev/shm when available."
+        ),
+    ] = None
     model_config_parser: A[
         str,
         Arg(
@@ -7045,6 +7102,55 @@ class ServerArgs:
             self._mamba_cache_chunk_size = max(chunk_size, self.page_size)
         return self._mamba_cache_chunk_size
 
+    def _check_tilert_server_args(self):
+        if self.tilert_model_type != "glm5":
+            raise ValueError(
+                "--model-impl=tilert currently supports only --tilert-model-type=glm5"
+            )
+
+        single_rank = (
+            self.nnodes == 1
+            and self.tp_size == 1
+            and self.pp_size == 1
+            and self.dp_size == 1
+            and self.attn_cp_size == 1
+            and self.moe_dp_size == 1
+            and self.ep_size == 1
+        )
+        if not single_rank:
+            raise ValueError(
+                "--model-impl=tilert supports only single-node, single-rank serving "
+                "(tp=pp=dp=attn_cp=moe_dp=ep=1)."
+            )
+
+        if self.disaggregation_mode != "null":
+            raise ValueError("--model-impl=tilert does not support disaggregation.")
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "--model-impl=tilert uses TileRT's internal MTP; do not set "
+                "--speculative-algorithm."
+            )
+        if self.skip_tokenizer_init:
+            raise ValueError(
+                "--model-impl=tilert requires SGLang tokenizer initialization."
+            )
+        if self.is_embedding or self.encoder_only:
+            raise ValueError("--model-impl=tilert supports generation models only.")
+        if self.enable_lora:
+            raise ValueError("--model-impl=tilert does not support LoRA.")
+        if self.enable_multimodal:
+            raise ValueError("--model-impl=tilert does not support multimodal inputs.")
+        if self.enable_pdmux:
+            raise ValueError("--model-impl=tilert does not support PD-Multiplexing.")
+        if self.enable_dp_attention:
+            raise ValueError("--model-impl=tilert does not support DP attention.")
+
+        if self.tilert_external_prefill:
+            if self.tilert_prefill_tp_size < 1:
+                raise ValueError("--tilert-prefill-tp-size must be >= 1.")
+            if not (0.0 < self.tilert_prefill_mem_fraction < 1.0):
+                raise ValueError("--tilert-prefill-mem-fraction must be in (0, 1).")
+
     def check_server_args(self):
         # Check parallel size constraints
         assert (
@@ -7176,6 +7282,8 @@ class ServerArgs:
 
         if self.model_impl == "mindspore":
             assert is_npu(), "MindSpore model impl is only supported on Ascend npu."
+        if self.model_impl == "tilert":
+            self._check_tilert_server_args()
 
         # Check metrics labels
         if (

@@ -3829,6 +3829,13 @@ class Scheduler(
     def save_sharded_model(self, **kwargs):
         self.weight_updater.save_sharded_model(kwargs)
 
+    def tilert_stage_prefill_kv(self, token_ids, out_path):
+        # Invoked via the generic scheduler RPC by a TileRT decode process to
+        # extract a prefilled prompt's (ki, kv, pe) caches for injection.
+        from sglang.srt.managers.tilert_prefill import stage_prefill_kv
+
+        stage_prefill_kv(self, token_ids, out_path)
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -4295,17 +4302,32 @@ def run_scheduler_process(
     # Create a scheduler and run the event loop
     scheduler = None
     try:
-        scheduler = Scheduler(
-            server_args,
-            port_args,
-            gpu_id,
-            tp_rank,
-            moe_ep_rank,
-            pp_rank,
-            attn_cp_rank,
-            moe_dp_rank,
-            dp_rank,
-        )
+        if server_args.model_impl == "tilert":
+            from sglang.srt.managers.tilert_scheduler import TileRTScheduler
+
+            scheduler = TileRTScheduler(
+                server_args,
+                port_args,
+                gpu_id,
+                tp_rank,
+                moe_ep_rank,
+                pp_rank,
+                attn_cp_rank,
+                moe_dp_rank,
+                dp_rank,
+            )
+        else:
+            scheduler = Scheduler(
+                server_args,
+                port_args,
+                gpu_id,
+                tp_rank,
+                moe_ep_rank,
+                pp_rank,
+                attn_cp_rank,
+                moe_dp_rank,
+                dp_rank,
+            )
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
@@ -4328,7 +4350,9 @@ def run_scheduler_process(
         if scheduler is not None:
             # FPM has a background ZMQ publisher thread that needs explicit
             # teardown to flush queued metrics and close the socket cleanly.
-            scheduler.metrics_reporter._shutdown_fpm()
+            metrics_reporter = getattr(scheduler, "metrics_reporter", None)
+            if metrics_reporter is not None:
+                metrics_reporter._shutdown_fpm()
             # Graceful path only: on the exception path the GPU may be wedged
             # and the synchronize() in destroy() could itself hang.
             if scheduler.gracefully_exit:
