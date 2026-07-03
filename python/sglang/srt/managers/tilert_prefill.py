@@ -61,7 +61,7 @@ def stage_prefill_kv(scheduler: Scheduler, token_ids: List[int], out_path: str) 
          "kv": bf16 [n_layers, cached_len, 512],
          "pe": bf16 [n_layers, cached_len, 64]}
     """
-    if scheduler.tp_rank != 0:
+    if scheduler.ps.tp_rank != 0:
         return
 
     from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
