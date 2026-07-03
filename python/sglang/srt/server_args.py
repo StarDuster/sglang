@@ -554,10 +554,13 @@ class ServerArgs:
     tilert_prefill_mem_fraction: A[
         float,
         (
-            "mem_fraction_static for the nested TileRT prefill engine. It "
-            "shares GPUs with TileRT, so keep this small."
+            "mem_fraction_static for the nested TileRT prefill engine. "
+            "SGLang accounts this fraction against TOTAL GPU memory, "
+            "including what TileRT (weights + preallocated KV) already "
+            "holds, so it must be high: TileRT-resident + prefill weights "
+            "+ prefill KV, e.g. ~0.85 for GLM-5.1 on 288GB B300s."
         ),
-    ] = 0.3
+    ] = 0.85
     tilert_prefill_staging_dir: A[
         Optional[str],
         (
