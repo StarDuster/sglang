@@ -169,9 +169,12 @@ class TileRTPrefillWorker:
             # at import time.
             from sglang.srt.entrypoints.engine import Engine
 
+            prefill_model_path = (
+                self.server_args.tilert_prefill_model_path
+                or self.server_args.model_path
+            )
             self._engine = Engine(
-                model_path=self.server_args.model_path,
-                tokenizer_path=self.server_args.tokenizer_path,
+                model_path=prefill_model_path,
                 trust_remote_code=self.server_args.trust_remote_code,
                 tp_size=self.server_args.tilert_prefill_tp_size,
                 mem_fraction_static=self.server_args.tilert_prefill_mem_fraction,

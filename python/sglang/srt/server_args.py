@@ -565,6 +565,14 @@ class ServerArgs:
             "and TileRT. Defaults to /dev/shm when available."
         ),
     ] = None
+    tilert_prefill_model_path: A[
+        Optional[str],
+        (
+            "HF model path for the nested TileRT prefill engine. Required "
+            "when --model-path points at TileRT-converted weights, which "
+            "SGLang cannot load."
+        ),
+    ] = None
     model_config_parser: A[
         str,
         Arg(
