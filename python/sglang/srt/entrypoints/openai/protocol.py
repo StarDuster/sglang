@@ -789,6 +789,24 @@ class ChatCompletionRequest(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def set_tool_choice_default(cls, values):
+        functions = values.get("functions")
+        if functions is not None and values.get("tools") is None:
+            values["tools"] = [
+                {"type": "function", "function": function} for function in functions
+            ]
+
+        function_call = values.get("function_call")
+        if function_call is not None and values.get("tool_choice") is None:
+            if isinstance(function_call, str):
+                values["tool_choice"] = function_call
+            elif isinstance(function_call, dict):
+                function_name = function_call.get("name")
+                if function_name:
+                    values["tool_choice"] = {
+                        "type": "function",
+                        "function": {"name": function_name},
+                    }
+
         if values.get("tool_choice") is None:
             if values.get("tools") is None:
                 values["tool_choice"] = "none"

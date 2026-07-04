@@ -118,6 +118,66 @@ class ServingChatTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
         self.fastapi_request.headers = {}
 
+    def test_legacy_functions_normalized_to_tools(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            functions=[
+                {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                        "required": ["location"],
+                    },
+                }
+            ],
+            function_call="auto",
+        )
+
+        self.assertEqual(req.tool_choice, "auto")
+        self.assertEqual(len(req.tools), 1)
+        self.assertEqual(req.tools[0].type, "function")
+        self.assertEqual(req.tools[0].function.name, "get_weather")
+
+    def test_legacy_function_call_name_normalized_to_tool_choice(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            functions=[
+                {
+                    "name": "get_weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"location": {"type": "string"}},
+                    },
+                }
+            ],
+            function_call={"name": "get_weather"},
+        )
+
+        self.assertEqual(req.tool_choice.function.name, "get_weather")
+        self.assertEqual(req.tool_choice.type, "function")
+        self.assertEqual(req.tools[0].function.name, "get_weather")
+
+    def test_legacy_functions_do_not_override_tools(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Weather?"}],
+            functions=[{"name": "legacy_weather"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {"name": "get_weather", "parameters": None},
+                }
+            ],
+        )
+
+        self.assertEqual(req.tool_choice, "auto")
+        self.assertEqual(len(req.tools), 1)
+        self.assertEqual(req.tools[0].function.name, "get_weather")
+
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):
         with (
