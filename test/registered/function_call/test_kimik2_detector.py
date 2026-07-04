@@ -1394,5 +1394,97 @@ class TestKimiK2BareCounterParsing(unittest.TestCase):
         self.assertEqual(tool_calls[0]["name"], "search")
 
 
+# ============================================================
+# Part 4: OpenAI-style call_xxx tool_call_id parsing
+# ============================================================
+
+
+class TestKimiK2OpenAICallIdFormat(unittest.TestCase):
+    """The model sometimes emits OpenAI-style ``call_<hex>`` IDs instead of
+    the native ``functions.{name}:{index}`` format (observed in auto-mode
+    runs with large tool sets). The detector must infer the function name
+    from arguments instead of dropping the tool call.
+    """
+
+    def setUp(self):
+        self.detector = KimiK2FuncDetector()
+        self.tools = [
+            _make_tool("ReadFile"),
+            _make_tool(
+                "get_weather",
+                {
+                    "type": "object",
+                    "properties": {
+                        "city": {"type": "string"},
+                        "unit": {"type": "string"},
+                    },
+                    "required": ["city"],
+                },
+            ),
+        ]
+
+    def test_parse_call_id_infers_name_from_args(self):
+        name, idx = self.detector._parse_tool_call_id(
+            "call_108783508eae4c44a42e4d3b",
+            self.tools,
+            '{"city": "Tokyo"}',
+        )
+        self.assertEqual(name, "get_weather")
+        self.assertEqual(idx, 0)
+
+    def test_parse_call_id_single_tool(self):
+        single = [_make_tool("search")]
+        name, idx = self.detector._parse_tool_call_id(
+            "call_abc123", single, '{"query": "test"}'
+        )
+        self.assertEqual(name, "search")
+        self.assertEqual(idx, 0)
+
+    def test_parse_call_id_no_tools_returns_none(self):
+        name, idx = self.detector._parse_tool_call_id(
+            "call_abc123", [], '{"x": 1}'
+        )
+        self.assertIsNone(name)
+        self.assertEqual(idx, 0)
+
+    def test_parse_call_id_unparsable_args_returns_none(self):
+        name, idx = self.detector._parse_tool_call_id(
+            "call_abc123", self.tools, '{"city": "Par'
+        )
+        self.assertIsNone(name)
+        self.assertEqual(idx, 0)
+
+    def test_detect_and_parse_call_id(self):
+        text = (
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>call_f8b96606a3f84a8c7a24eaaf"
+            '<|tool_call_argument_begin|>{"city": "Tokyo"}'
+            "<|tool_call_end|>"
+            "<|tool_calls_section_end|>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[0].parameters, '{"city": "Tokyo"}')
+
+    def test_streaming_call_id(self):
+        chunks = [
+            "<|tool_calls_section_begin|>"
+            "<|tool_call_begin|>call_f8b96606a3f84a8c7a24eaaf"
+            '<|tool_call_argument_begin|>{"city',
+            '": "Tokyo"}',
+            "<|tool_call_end|>",
+            "<|tool_calls_section_end|>",
+        ]
+        tool_calls, _ = _collect_streaming_tool_calls(
+            self.detector, chunks, self.tools
+        )
+        self.assertEqual(len(tool_calls), 1)
+        self.assertEqual(tool_calls[0]["name"], "get_weather")
+        self.assertEqual(
+            json.loads(tool_calls[0]["parameters"]), {"city": "Tokyo"}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
