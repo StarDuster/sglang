@@ -31,6 +31,7 @@ import os
 import queue
 import tempfile
 import threading
+import time
 import uuid
 from array import array
 from types import SimpleNamespace
@@ -160,6 +161,7 @@ class TileRTPrefillWorker:
 
         self._jobs: queue.Queue[Optional[tuple]] = queue.Queue()
         self._ready = threading.Event()
+        self._broken = False
         self._init_error: Optional[BaseException] = None
         self._thread = threading.Thread(
             target=self._engine_thread, name="tilert-prefill-engine", daemon=True
@@ -196,15 +198,28 @@ class TileRTPrefillWorker:
             self._ready.set()
             return
 
-        # KV-pool ceiling of the nested engine; prompts beyond it are
-        # externally prefilled up to the cap and finished by TileRT's
-        # internal prefill (partial injection).
-        self.max_prefill_tokens = int(
+        # The nested Engine downgrades this process's sglang logging to its
+        # own log_level (warning); restore INFO so the TileRT scheduler's
+        # request-lifecycle logs stay visible.
+        logging.getLogger("sglang").setLevel(logging.INFO)
+
+        # KV-pool ceiling of the nested engine. max_req_input_len alone is
+        # not schedulable headroom: a request also needs reserved decode
+        # slots, and one that never fits waits in the queue forever. Prompts
+        # beyond the cap are externally prefilled up to it and finished by
+        # TileRT's internal prefill (partial injection).
+        scheduler_info = self._engine._scheduler_init_result.scheduler_infos[0]
+        max_total = int(scheduler_info.get("max_total_num_tokens", 0) or 0)
+        max_input = int(
             getattr(self._engine.tokenizer_manager, "max_req_input_len", 0) or 0
         )
-        logger.info(
-            "TileRT prefill engine ready. max_prefill_tokens=%s "
-            "(prompts beyond this are partially injected)",
+        self.max_prefill_tokens = max(0, min(max_input, max_total - 1024))
+        logger.warning(
+            "TileRT prefill engine ready. max_total_num_tokens=%s "
+            "max_req_input_len=%s -> external prefill cap=%s tokens "
+            "(longer prompts are partially injected)",
+            max_total,
+            max_input,
             self.max_prefill_tokens,
         )
         self._ready.set()
@@ -213,21 +228,21 @@ class TileRTPrefillWorker:
             if job is None:
                 self._engine.shutdown()
                 return
-            token_ids, result_box, done = job
+            token_ids, rid, result_box, done = job
             try:
-                result_box["result"] = self._prefill_on_thread(token_ids)
+                result_box["result"] = self._prefill_on_thread(token_ids, rid)
             except BaseException as exc:  # noqa: BLE001 - surfaced to caller
                 result_box["error"] = exc
             finally:
                 done.set()
 
-    def _prefill_on_thread(self, token_ids: List[int]) -> Tuple[int, LayerCaches]:
+    def _prefill_on_thread(
+        self, token_ids: List[int], rid: str
+    ) -> Tuple[int, LayerCaches]:
         if 0 < self.max_prefill_tokens < len(token_ids):
-            # Cap to the nested engine's KV pool; page-align so the radix
-            # match covers the whole capped prefix. The uncached tail runs
-            # through TileRT internal prefill after injection.
-            cap = (self.max_prefill_tokens - 8) // 64 * 64
-            logger.info(
+            # Page-align so the radix match covers the whole capped prefix.
+            cap = self.max_prefill_tokens // 64 * 64
+            logger.warning(
                 "Prompt (%s tokens) exceeds prefill engine capacity (%s); "
                 "externally prefilling first %s tokens",
                 len(token_ids),
@@ -238,6 +253,7 @@ class TileRTPrefillWorker:
         self._engine.generate(
             input_ids=token_ids,
             sampling_params={"max_new_tokens": 1, "temperature": 0.0},
+            rid=rid,
         )
 
         out_path = os.path.join(self.staging_dir, f"tilert_kv_{uuid.uuid4().hex}.pt")
@@ -258,17 +274,55 @@ class TileRTPrefillWorker:
         ]
         return cached_len, layer_caches
 
-    def prefill(self, token_ids: List[int]) -> Tuple[int, LayerCaches]:
+    def prefill(
+        self,
+        token_ids: List[int],
+        cancel: Optional[threading.Event] = None,
+    ) -> Tuple[int, LayerCaches]:
         """Run SGLang prefill for ``token_ids`` and return (cached_len, layer_caches).
+
+        Bounded: on timeout or ``cancel``, the nested request is aborted and
+        this raises so the caller falls back to internal prefill. A nested
+        engine that fails to honor the abort marks the worker broken (all
+        later calls fail fast) instead of wedging the single-flight
+        scheduler forever.
 
         ``cached_len`` is capped at the prompt length because
         GLM5Generator.start_sequence_from_cache treats it as the number of
         main-model KV rows already populated, not as the runtime cur_pos.
         """
+        if self._broken:
+            raise RuntimeError(
+                "TileRT prefill engine is marked broken after an unrecoverable "
+                "timeout; restart the server to re-enable external prefill"
+            )
+
+        rid = f"tilert-prefill-{uuid.uuid4().hex}"
         result_box: dict[str, Any] = {}
         done = threading.Event()
-        self._jobs.put((token_ids, result_box, done))
-        done.wait()
+        self._jobs.put((token_ids, rid, result_box, done))
+
+        # Generous ceiling: staging is O(seconds) and SGLang prefill runs at
+        # thousands of tokens/s, so 5ms/token + fixed slack is far above any
+        # healthy run (a 115k prompt gets ~13 minutes).
+        deadline = time.monotonic() + 180.0 + 0.005 * len(token_ids)
+        aborted = False
+        while not done.wait(timeout=1.0):
+            cancelled = cancel is not None and cancel.is_set()
+            if not aborted and (cancelled or time.monotonic() > deadline):
+                reason = "cancelled" if cancelled else "timed out"
+                logger.warning("External prefill %s; aborting rid=%s", reason, rid)
+                self._engine.tokenizer_manager.abort_request(rid=rid)
+                aborted = True
+                abort_deadline = time.monotonic() + 30.0
+            if aborted and time.monotonic() > abort_deadline:
+                self._broken = True
+                raise RuntimeError(
+                    "TileRT prefill engine did not honor abort; worker disabled"
+                )
+
+        if aborted and "error" not in result_box and "result" not in result_box:
+            raise RuntimeError("External prefill aborted")
         if "error" in result_box:
             raise result_box["error"]
         cached_len, layer_caches = result_box["result"]

@@ -464,6 +464,7 @@ class TileRTScheduler:
         rid: str,
         prompt_tokens: list[int],
         sampling_params: Any,
+        cancel: threading.Event | None = None,
     ) -> None:
         """Start the TileRT sequence, preferring SGLang external prefill."""
         with_mtp = not self.server_args.tilert_disable_mtp
@@ -473,7 +474,9 @@ class TileRTScheduler:
         ):
             try:
                 prefill_start = time.monotonic()
-                cached_len, layer_caches = self.prefill_worker.prefill(prompt_tokens)
+                cached_len, layer_caches = self.prefill_worker.prefill(
+                    prompt_tokens, cancel=cancel
+                )
                 if cached_len >= 1:
                     self.generator.start_sequence_from_cache(
                         prompt_tokens,
@@ -530,7 +533,7 @@ class TileRTScheduler:
                 len(prompt_tokens),
                 sampling_params.max_new_tokens,
             )
-            self._start_generator_sequence(rid, prompt_tokens, sampling_params)
+            self._start_generator_sequence(rid, prompt_tokens, sampling_params, cancel)
             while not cancel.is_set() and not self.generator.is_sequence_finished():
                 token_ids = self.generator.next_tokens()
                 (
