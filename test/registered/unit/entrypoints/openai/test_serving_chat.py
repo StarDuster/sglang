@@ -987,6 +987,23 @@ class ServingChatTestCase(unittest.TestCase):
             tool_calls = payload["choices"][0]["delta"]["tool_calls"]
             self.assertEqual(tool_calls[0]["id"], "functions.get_weather:0")
 
+    def test_tilert_required_tools_do_not_create_structured_constraint(self):
+        self.tm.server_args.model_impl = "tilert"
+        self.tm.server_args.tool_call_parser = "glm47"
+        self.chat.tool_call_parser = "glm47"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use get_weather for Tokyo."}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="required",
+            input_ids=[1, 2, 3],
+        )
+
+        result = self.chat._process_messages(req, is_multimodal=False)
+
+        self.assertIsNone(result.tool_call_constraint)
+
     def test_kimi_k2_non_streaming_tool_call_id_with_history(self):
         """Ensure non-streaming tool_call.id increase with tool calls history for kimi_k2 parser."""
 
@@ -2338,6 +2355,87 @@ class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
         )
 
         self.assertIsNone(tool_calls)
+
+    def test_tilert_required_native_tool_call_uses_parser_without_structural_tag(self):
+        self.chat.tokenizer_manager.server_args.model_impl = "tilert"
+        self.chat.tool_call_parser = "glm47"
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            call_info = Mock()
+            call_info.name = "get_weather"
+            call_info.parameters = '{"location":"Tokyo"}'
+            call_info.tool_index = 0
+
+            parser_instance = ParserMock.return_value
+            parser_instance.detector.supports_structural_tag.return_value = False
+            parser_instance.has_tool_call.return_value = True
+            parser_instance.parse_non_stream.return_value = ("", [call_info])
+
+            finish_reason = {"type": "stop", "matched": None}
+            tools = [{"type": "function", "function": {"name": "get_weather"}}]
+
+            tool_calls, text, fr = self.chat._process_tool_calls(
+                text=(
+                    "<tool_call>get_weather"
+                    "<arg_key>location</arg_key><arg_value>Tokyo</arg_value>"
+                    "</tool_call>"
+                ),
+                tools=tools,
+                finish_reason=finish_reason,
+                tool_choice="required",
+            )
+
+            self.assertIsNotNone(tool_calls)
+            self.assertEqual(text, "")
+            self.assertEqual(tool_calls[0].function.name, "get_weather")
+            self.assertEqual(fr["type"], "tool_calls")
+
+    def test_tilert_required_streaming_uses_native_parser_without_structural_tag(self):
+        self.chat.tokenizer_manager.server_args.model_impl = "tilert"
+        self.chat.tool_call_parser = "glm47"
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Use get_weather for Tokyo."}],
+            tools=[{"type": "function", "function": {"name": "get_weather"}}],
+            tool_choice="required",
+            stream=True,
+        )
+
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.FunctionCallParser"
+        ) as ParserMock:
+            call_info = Mock()
+            call_info.name = "get_weather"
+            call_info.parameters = ""
+            call_info.tool_index = 0
+
+            parser_instance = ParserMock.return_value
+            parser_instance.detector.supports_structural_tag.return_value = False
+            parser_instance.parse_stream_chunk.return_value = ("", [call_info])
+
+            async def collect_first_tool_chunk():
+                gen = self.chat._process_tool_call_stream(
+                    index=0,
+                    delta="<tool_call>get_weather",
+                    parser_dict={},
+                    content={"meta_info": {"id": "chatcmpl-test"}},
+                    request=req,
+                    has_tool_calls={},
+                )
+                async for emitted in gen:
+                    return emitted
+                return None
+
+            loop = get_or_create_event_loop()
+            line = loop.run_until_complete(collect_first_tool_chunk())
+
+            self.assertIsNotNone(line)
+            payload = json.loads(line[len("data: ") :])
+            tool_calls = payload["choices"][0]["delta"]["tool_calls"]
+            self.assertEqual(tool_calls[0]["function"]["name"], "get_weather")
 
 
 class TestNormalizeToolContent(unittest.TestCase):

@@ -531,6 +531,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
+    def _uses_unconstrained_tool_parsing(self) -> bool:
+        return (
+            getattr(self.tokenizer_manager.server_args, "model_impl", None) == "tilert"
+        )
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -667,7 +672,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ]
             else:
                 tools = [item.model_dump() for item in request.tools]
-            if self.tool_call_parser:
+            if self.tool_call_parser and not self._uses_unconstrained_tool_parsing():
                 parser = FunctionCallParser(request.tools, self.tool_call_parser)
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
@@ -676,9 +681,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
             # Fallback: use generic JSON schema for required/named tool choice
             # only when no parser-specific constraint was set
-            if tool_call_constraint is None and (
-                request.tool_choice == "required"
-                or isinstance(request.tool_choice, ToolChoice)
+            if (
+                tool_call_constraint is None
+                and not self._uses_unconstrained_tool_parsing()
+                and (
+                    request.tool_choice == "required"
+                    or isinstance(request.tool_choice, ToolChoice)
+                )
             ):
                 json_schema = get_json_schema_constraint(
                     request.tools,
@@ -1507,12 +1516,15 @@ class OpenAIServingChat(OpenAIServingBase):
         is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
 
         # Try model-specific parser when output is in native format.
-        # For required/named: only use parser when structural_tag was used
-        # as constraint (mirrors the streaming path). For auto: always try.
+        # For required/named: use parser when structural_tag was used as
+        # constraint. TileRT cannot enforce structured output, so it parses
+        # model-native tool calls post generation. For auto: always try.
         if self.tool_call_parser:
             parser = FunctionCallParser(tools, self.tool_call_parser)
             should_try_parser = (
-                not is_required or parser.detector.supports_structural_tag()
+                not is_required
+                or parser.detector.supports_structural_tag()
+                or self._uses_unconstrained_tool_parsing()
             )
             if should_try_parser and parser.has_tool_call(text):
                 original_finish_type = finish_reason["type"]
@@ -1858,9 +1870,9 @@ class OpenAIServingChat(OpenAIServingBase):
             )
             # For required/named tool choice: use JsonArrayParser when the
             # constrained output is plain JSON (detector doesn't support
-            # structural_tag or no parser configured). Use FunctionCallParser
-            # only when the detector supports structural_tag and will produce
-            # native format output.
+            # structural_tag or no parser configured). TileRT does not enforce
+            # the constraint and relies on native model output, so parse with
+            # FunctionCallParser there.
             if is_required:
                 use_native_parser = False
                 if self.tool_call_parser:
@@ -1868,7 +1880,10 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=request.tools,
                         tool_call_parser=self.tool_call_parser,
                     )
-                    use_native_parser = probe.detector.supports_structural_tag()
+                    use_native_parser = (
+                        self._uses_unconstrained_tool_parsing()
+                        or probe.detector.supports_structural_tag()
+                    )
                 if use_native_parser:
                     parser_dict[index] = probe
                 else:
