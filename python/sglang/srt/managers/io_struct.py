@@ -1903,6 +1903,7 @@ class RpcReqInput(BaseReq, kw_only=True):
 class RpcReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    serialized_result: Optional[bytes] = None
 
 
 class LoadLoRAAdapterReqInput(BaseReq, kw_only=True):

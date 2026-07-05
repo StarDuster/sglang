@@ -884,15 +884,22 @@ class Glm4MoeLiteModel(nn.Module):
                 }
             )
         else:
+            hidden_states_before_norm = None
             if not forward_batch.forward_mode.is_idle():
+                if forward_batch.return_hidden_states_before_norm:
+                    hidden_states_before_norm = (
+                        hidden_states if residual is None else hidden_states + residual
+                    )
                 if residual is None:
                     hidden_states = self.norm(hidden_states)
                 else:
                     hidden_states, _ = self.norm(hidden_states, residual)
 
         if len(aux_hidden_states) == 0:
+            if hidden_states_before_norm is not None:
+                return hidden_states, hidden_states_before_norm
             return hidden_states
-        return hidden_states, aux_hidden_states
+        return hidden_states, aux_hidden_states, hidden_states_before_norm
 
 
 class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
@@ -983,12 +990,25 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         aux_hidden_states = None
+        hidden_states_before_norm = None
         if self.capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
+            if len(hidden_states) == 3:
+                hidden_states, aux_hidden_states, hidden_states_before_norm = (
+                    hidden_states
+                )
+            else:
+                hidden_states, aux_hidden_states = hidden_states
+        elif forward_batch.return_hidden_states_before_norm:
+            hidden_states, hidden_states_before_norm = hidden_states
 
         if self.pp_group.is_last_rank:
             return self.logits_processor(
-                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                aux_hidden_states,
+                hidden_states_before_norm=hidden_states_before_norm,
             )
         else:
             return hidden_states

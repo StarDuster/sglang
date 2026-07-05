@@ -87,6 +87,10 @@ class KimiK2Detector(BaseFormatDetector):
         # Bare call counter: "0", "3" (model uses auto-incrementing counter)
         self.tool_call_id_counter_regex = re.compile(r"^\d+$")
 
+        # OpenAI-style call ID: "call_abc123..." (model emits this instead of
+        # the native "functions.{name}:{index}" format in some auto-mode runs).
+        self.tool_call_id_call_regex = re.compile(r"^call_[a-zA-Z0-9]+$")
+
     def _parse_tool_call_id(
         self, function_id: str, tools: List[Tool], function_args: str = None
     ):
@@ -94,6 +98,7 @@ class KimiK2Detector(BaseFormatDetector):
 
         Standard format: "functions.ReadFile:0" → ("ReadFile", 0)
         Bare counter:    "3" → call_index=3, infer name from arguments.
+        OpenAI call ID:  "call_abc123" → infer name from arguments, index=0.
 
         The bare counter is a conversation-level auto-increment, NOT an index
         into the tools list. The function name is inferred by matching argument
@@ -109,6 +114,12 @@ class KimiK2Detector(BaseFormatDetector):
             if name:
                 return name, call_index
             return None, call_index
+
+        if self.tool_call_id_call_regex.match(function_id):
+            name = self._infer_tool_name(tools, function_args)
+            if name:
+                return name, 0
+            return None, 0
 
         logger.warning("Unexpected tool_call_id format: %s", function_id)
         return None, 0

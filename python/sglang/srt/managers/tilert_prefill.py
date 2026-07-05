@@ -14,9 +14,9 @@ Two halves:
   a file the TileRT process can read.
 
 * ``TileRTPrefillWorker`` runs inside the TileRT scheduler process. It owns a
-  nested ``sglang.Engine`` (prefill-only: radix cache on, CUDA graphs off) on
+  nested ``sglang.Engine`` (prefill-only: radix cache on) on
   a dedicated thread, and exposes a blocking ``prefill()`` that returns
-  ``(cached_len, layer_caches)`` ready for injection.
+  ``(cached_len, layer_caches, last_hidden_state)`` ready for injection.
 
 The hand-off returns the full main-model prompt KV when it is present in
 SGLang's radix cache. TileRT's MTP draft-layer cache is not transferred, so
@@ -46,25 +46,53 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 LayerCaches = List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+PrefillResult = Tuple[int, LayerCaches, Optional[torch.Tensor]]
+_PREFILL_WARMUP_TOKENS = 32768
 
 
-def stage_prefill_kv(scheduler: Scheduler, token_ids: List[int], out_path: str) -> None:
-    """Gather (ki, kv, pe) for the cached prefix of ``token_ids`` and stage to disk.
+def _page_align_tokens(num_tokens: int) -> int:
+    return num_tokens // 64 * 64
 
-    Runs inside the prefill engine's scheduler process (all ranks receive the
-    RPC; only attention-TP rank 0 does the work since the MLA latent cache is
-    replicated across ranks).
 
-    The staged file contains::
+def _external_prefill_warmup_len(min_tokens: int, max_prefill_tokens: int) -> int:
+    cap = _page_align_tokens(max_prefill_tokens)
+    if cap <= 0:
+        return 0
+    return min(_page_align_tokens(max(min_tokens, _PREFILL_WARMUP_TOKENS)), cap)
 
-        {"cached_len": int,
-         "ki": bf16 [n_layers, cached_len, 128],
-         "kv": bf16 [n_layers, cached_len, 512],
-         "pe": bf16 [n_layers, cached_len, 64]}
+
+def _build_prefill_engine_kwargs(
+    server_args: ServerArgs, prefill_model_path: str
+) -> dict:
+    return {
+        "model_path": prefill_model_path,
+        "trust_remote_code": server_args.trust_remote_code,
+        "tp_size": server_args.tilert_prefill_tp_size,
+        "mem_fraction_static": server_args.tilert_prefill_mem_fraction,
+        "context_length": server_args.context_length,
+        "quantization": "fp8",
+        "kv_cache_dtype": "fp8_e4m3",
+        "attention_backend": "dsa",
+        "dsa_prefill_backend": "trtllm",
+        "dsa_decode_backend": "trtllm",
+        "enable_dsa_prefill_context_parallel": True,
+        "dsa_prefill_cp_mode": "round-robin-split",
+        "attn_cp_size": server_args.tilert_prefill_tp_size,
+        "skip_server_warmup": True,
+        "disable_cuda_graph": True,
+        "log_level": "warning",
+    }
+
+
+def _collect_prefill_kv(
+    scheduler: Scheduler, token_ids: List[int], *, device: str | torch.device
+) -> Tuple[int, LayerCaches, float]:
+    """Gather (ki, kv, pe) for the cached prefix of ``token_ids``.
+
+    Runs inside the prefill engine's rank-0 scheduler process. ``device="cpu"``
+    is the compatibility file-staging path; ``device="cuda"`` is the hot path
+    used with PyTorch CUDA IPC.
     """
-    if scheduler.ps.tp_rank != 0:
-        return
-
     from sglang.srt.layers.attention.dsa import dsa_indexer
     from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -75,10 +103,15 @@ def stage_prefill_kv(scheduler: Scheduler, token_ids: List[int], out_path: str) 
         raise RuntimeError(
             f"TileRT prefill staging requires a DSATokenToKVPool, got {type(pool).__name__}"
         )
-    if pool.dtype not in (torch.bfloat16, torch.float16):
+    if pool.dtype not in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
         raise RuntimeError(
-            "TileRT prefill staging requires a bf16 KV cache in the prefill "
-            f"engine (got {pool.dtype}); do not pass an fp8 --kv-cache-dtype"
+            "TileRT prefill staging requires a bf16/fp16/fp8 KV cache in the prefill "
+            f"engine (got {pool.dtype})"
         )
 
     match_result = scheduler.tree_cache.match_prefix(
@@ -100,18 +133,15 @@ def stage_prefill_kv(scheduler: Scheduler, token_ids: List[int], out_path: str) 
     page_indices = (page_starts // page_size).to(torch.int32)
 
     n_layers = pool.layer_num
-    ki_all = torch.empty(n_layers, cached_len, 128, dtype=torch.bfloat16)
-    kv_all = torch.empty(n_layers, cached_len, pool.kv_lora_rank, dtype=torch.bfloat16)
-    pe_all = torch.empty(
-        n_layers, cached_len, pool.qk_rope_head_dim, dtype=torch.bfloat16
-    )
+    layer_caches: LayerCaches = []
 
-    for i, layer_id in enumerate(range(pool.start_layer, pool.start_layer + n_layers)):
+    gather_start = time.monotonic()
+    for layer_id in range(pool.start_layer, pool.start_layer + n_layers):
         nope, rope = pool.get_mla_kv_buffer(
             SimpleNamespace(layer_id=layer_id), slots, dst_dtype=torch.bfloat16
         )
-        kv_all[i].copy_(nope.squeeze(1))
-        pe_all[i].copy_(rope.squeeze(1))
+        kv = nope.squeeze(1).to(device=device, non_blocking=True)
+        pe = rope.squeeze(1).to(device=device, non_blocking=True)
 
         k_fp8 = pool.get_index_k_continuous(layer_id, cached_len, page_indices)
         k_scale = pool.get_index_k_scale_continuous(layer_id, cached_len, page_indices)
@@ -125,18 +155,81 @@ def stage_prefill_kv(scheduler: Scheduler, token_ids: List[int], out_path: str) 
         # here to match; the non-fused path already stores rotated keys.
         if dsa_indexer._use_dsa_indexer_fusion:
             ki = dsa_indexer.rotate_activation(ki)
-        ki_all[i].copy_(ki)
+        ki = ki.to(device=device, non_blocking=True)
+        layer_caches.append((ki, kv, pe))
+
+    if torch.device(device).type == "cuda":
+        torch.cuda.synchronize()
+    gather_elapsed = time.monotonic() - gather_start
+    return cached_len, layer_caches, gather_elapsed
+
+
+def export_prefill_kv(
+    scheduler: Scheduler, token_ids: List[int], rid: str | None = None
+):
+    """Return CUDA IPC-serializable prefill KV tensors for TileRT injection."""
+    if scheduler.ps.tp_rank != 0:
+        return None
+
+    cached_len, layer_caches, gather_elapsed = _collect_prefill_kv(
+        scheduler, token_ids, device="cuda"
+    )
+    last_hidden_state = None
+    if rid is not None:
+        last_hidden_state = getattr(
+            scheduler, "_tilert_prefill_last_hidden_states", {}
+        ).pop(rid, None)
+    logger.warning(
+        "Exported TileRT prefill KV: tokens=%s layers=%s gather=%.3fs transport=cuda_ipc last_hidden=%s",
+        cached_len,
+        len(layer_caches),
+        gather_elapsed,
+        last_hidden_state is not None,
+    )
+    return cached_len, layer_caches, last_hidden_state, gather_elapsed
+
+
+def stage_prefill_kv(scheduler: Scheduler, token_ids: List[int], out_path: str) -> None:
+    """Gather (ki, kv, pe) for the cached prefix of ``token_ids`` and stage to disk.
+
+    The staged file contains::
+
+        {"cached_len": int,
+         "ki": bf16 [n_layers, cached_len, 128],
+         "kv": bf16 [n_layers, cached_len, 512],
+         "pe": bf16 [n_layers, cached_len, 64]}
+    """
+    if scheduler.ps.tp_rank != 0:
+        deadline = time.monotonic() + 600
+        while not os.path.exists(out_path):
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for TileRT prefill KV staging at {out_path}"
+                )
+            time.sleep(0.01)
+        return
+
+    cached_len, layer_caches, gather_elapsed = _collect_prefill_kv(
+        scheduler, token_ids, device="cpu"
+    )
+    ki_all = torch.stack([ki for ki, _, _ in layer_caches])
+    kv_all = torch.stack([kv for _, kv, _ in layer_caches])
+    pe_all = torch.stack([pe for _, _, pe in layer_caches])
 
     tmp_path = f"{out_path}.tmp"
+    save_start = time.monotonic()
     torch.save(
         {"cached_len": cached_len, "ki": ki_all, "kv": kv_all, "pe": pe_all},
         tmp_path,
     )
     os.rename(tmp_path, out_path)
-    logger.info(
-        "Staged TileRT prefill KV: %s tokens x %s layers -> %s",
+    save_elapsed = time.monotonic() - save_start
+    logger.warning(
+        "Staged TileRT prefill KV: tokens=%s layers=%s gather=%.3fs save=%.3fs path=%s",
         cached_len,
-        n_layers,
+        len(layer_caches),
+        gather_elapsed,
+        save_elapsed,
         out_path,
     )
 
@@ -167,7 +260,11 @@ class TileRTPrefillWorker:
             target=self._engine_thread, name="tilert-prefill-engine", daemon=True
         )
         self._thread.start()
-        self._ready.wait()
+
+    def _ensure_ready(self, cancel: Optional[threading.Event] = None) -> None:
+        while not self._ready.wait(timeout=1.0):
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("TileRT prefill engine initialization cancelled")
         if self._init_error is not None:
             raise RuntimeError(
                 "Failed to launch TileRT prefill engine"
@@ -183,16 +280,19 @@ class TileRTPrefillWorker:
                 self.server_args.tilert_prefill_model_path
                 or self.server_args.model_path
             )
-            self._engine = Engine(
-                model_path=prefill_model_path,
-                trust_remote_code=self.server_args.trust_remote_code,
-                tp_size=self.server_args.tilert_prefill_tp_size,
-                mem_fraction_static=self.server_args.tilert_prefill_mem_fraction,
-                context_length=self.server_args.context_length,
-                kv_cache_dtype="bfloat16",
-                disable_cuda_graph=True,
-                log_level="warning",
-            )
+            old_memory_check = os.environ.get("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK")
+            os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] = "false"
+            try:
+                self._engine = Engine(
+                    **_build_prefill_engine_kwargs(self.server_args, prefill_model_path)
+                )
+            finally:
+                if old_memory_check is None:
+                    os.environ.pop("SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK", None)
+                else:
+                    os.environ["SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK"] = (
+                        old_memory_check
+                    )
         except BaseException as exc:  # noqa: BLE001 - surfaced to caller
             self._init_error = exc
             self._ready.set()
@@ -236,9 +336,27 @@ class TileRTPrefillWorker:
             finally:
                 done.set()
 
-    def _prefill_on_thread(
-        self, token_ids: List[int], rid: str
-    ) -> Tuple[int, LayerCaches]:
+    def _warmup_external_prefill(self) -> None:
+        warmup_len = _external_prefill_warmup_len(
+            self.server_args.tilert_prefill_min_tokens, self.max_prefill_tokens
+        )
+        if warmup_len <= 0:
+            return
+
+        warmup_start = time.monotonic()
+        cached_len, layer_caches, _ = self._prefill_on_thread(
+            [1] * warmup_len, "__tilert_external_prefill_warmup__"
+        )
+        del layer_caches
+        self._engine.flush_cache()
+        logger.warning(
+            "TileRT external prefill warmup done. tokens=%s cached=%s elapsed=%.2fs",
+            warmup_len,
+            cached_len,
+            time.monotonic() - warmup_start,
+        )
+
+    def _prefill_on_thread(self, token_ids: List[int], rid: str) -> PrefillResult:
         if 0 < self.max_prefill_tokens < len(token_ids):
             # Page-align so the radix match covers the whole capped prefix.
             cap = self.max_prefill_tokens // 64 * 64
@@ -250,18 +368,48 @@ class TileRTPrefillWorker:
                 cap,
             )
             token_ids = token_ids[:cap]
+        generate_start = time.monotonic()
         self._engine.generate(
             input_ids=token_ids,
             sampling_params={"max_new_tokens": 1, "temperature": 0.0},
             rid=rid,
         )
+        generate_elapsed = time.monotonic() - generate_start
+
+        try:
+            export_start = time.monotonic()
+            result = self._engine.collective_rpc_with_result(
+                "tilert_export_prefill_kv", token_ids=token_ids, rid=rid
+            )
+            export_elapsed = time.monotonic() - export_start
+            if result is None:
+                raise RuntimeError("TileRT prefill KV export returned no payload")
+            cached_len, layer_caches, last_hidden_state, gather_elapsed = result
+            logger.warning(
+                "TileRT external prefill timings: tokens=%s cached=%s generate=%.3fs gather=%.3fs ipc=%.3fs load=0.000s last_hidden=%s",
+                len(token_ids),
+                cached_len,
+                generate_elapsed,
+                gather_elapsed,
+                export_elapsed,
+                last_hidden_state is not None,
+            )
+            return int(cached_len), layer_caches, last_hidden_state
+        except Exception:
+            logger.exception(
+                "CUDA IPC TileRT prefill export failed; falling back to file staging"
+            )
 
         out_path = os.path.join(self.staging_dir, f"tilert_kv_{uuid.uuid4().hex}.pt")
         try:
+            stage_start = time.monotonic()
             self._engine.collective_rpc(
                 "tilert_stage_prefill_kv", token_ids=token_ids, out_path=out_path
             )
-            data = torch.load(out_path, weights_only=True)
+            stage_elapsed = time.monotonic() - stage_start
+            load_start = time.monotonic()
+            data = torch.load(out_path, map_location="cpu", weights_only=True)
+            load_elapsed = time.monotonic() - load_start
         finally:
             for path in (out_path, f"{out_path}.tmp"):
                 if os.path.exists(path):
@@ -272,14 +420,22 @@ class TileRTPrefillWorker:
             (data["ki"][i], data["kv"][i], data["pe"][i])
             for i in range(data["ki"].shape[0])
         ]
-        return cached_len, layer_caches
+        logger.warning(
+            "TileRT external prefill timings: tokens=%s cached=%s generate=%.3fs stage_rpc=%.3fs load=%.3fs",
+            len(token_ids),
+            cached_len,
+            generate_elapsed,
+            stage_elapsed,
+            load_elapsed,
+        )
+        return cached_len, layer_caches, None
 
     def prefill(
         self,
         token_ids: List[int],
         cancel: Optional[threading.Event] = None,
-    ) -> Tuple[int, LayerCaches]:
-        """Run SGLang prefill for ``token_ids`` and return (cached_len, layer_caches).
+    ) -> PrefillResult:
+        """Run SGLang prefill for ``token_ids`` and return cache tensors.
 
         Bounded: on timeout or ``cancel``, the nested request is aborted and
         this raises so the caller falls back to internal prefill. A nested
@@ -296,6 +452,7 @@ class TileRTPrefillWorker:
                 "TileRT prefill engine is marked broken after an unrecoverable "
                 "timeout; restart the server to re-enable external prefill"
             )
+        self._ensure_ready(cancel)
 
         rid = f"tilert-prefill-{uuid.uuid4().hex}"
         result_box: dict[str, Any] = {}
@@ -325,8 +482,8 @@ class TileRTPrefillWorker:
             raise RuntimeError("External prefill aborted")
         if "error" in result_box:
             raise result_box["error"]
-        cached_len, layer_caches = result_box["result"]
-        return min(cached_len, len(token_ids)), layer_caches
+        cached_len, layer_caches, last_hidden_state = result_box["result"]
+        return min(cached_len, len(token_ids)), layer_caches, last_hidden_state
 
     def shutdown(self) -> None:
         self._jobs.put(None)

@@ -1245,6 +1245,20 @@ class Engine(EngineScoreMixin, EngineBase):
         assert isinstance(recv_req, RpcReqOutput)
         assert recv_req.success, recv_req.message
 
+    def collective_rpc_with_result(self, method: str, **kwargs):
+        obj = RpcReqInput(method=method, parameters=kwargs)
+        sock_send(self.send_to_rpc, obj)
+        recv_req = sock_recv(self.send_to_rpc, flags=zmq.BLOCKY)
+        assert isinstance(recv_req, RpcReqOutput)
+        assert recv_req.success, recv_req.message
+        if recv_req.serialized_result is None:
+            return None
+
+        from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+        monkey_patch_torch_reductions()
+        return MultiprocessingSerializer.deserialize(recv_req.serialized_result)
+
     def save_remote_model(self, **kwargs):
         self.collective_rpc("save_remote_model", **kwargs)
 

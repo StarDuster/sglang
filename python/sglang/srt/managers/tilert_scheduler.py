@@ -38,6 +38,7 @@ from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcCh
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.managers.tilert_utils import cached_len_after_external_prefill_tail
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -143,7 +144,7 @@ class TileRTScheduler:
 
             self.prefill_worker = TileRTPrefillWorker(server_args)
             logger.info(
-                "TileRT external prefill engine ready. tp=%s mem_fraction=%s",
+                "TileRT external prefill engine launching. tp=%s mem_fraction=%s",
                 server_args.tilert_prefill_tp_size,
                 server_args.tilert_prefill_mem_fraction,
             )
@@ -192,6 +193,7 @@ class TileRTScheduler:
         )
         tilert.load_backend(self.server_args.tilert_model_type)
         model_args = ModelArgsGLM5()
+        model_args.index_topk = int(self.server_args.tilert_index_topk)
         if self.max_total_num_tokens > 0:
             model_args.max_seq_len = min(
                 int(model_args.max_seq_len), int(self.max_total_num_tokens)
@@ -206,6 +208,7 @@ class TileRTScheduler:
             top_k=1,
             enable_thinking=self.server_args.tilert_enable_thinking,
             sampling_seed=self.server_args.random_seed,
+            mtp_cache_mode=self.server_args.tilert_mtp_cache_mode,
         )
         generator.from_pretrained()
         tilert_max_seq_len = int(generator.config.max_seq_len)
@@ -474,13 +477,22 @@ class TileRTScheduler:
         ):
             try:
                 prefill_start = time.monotonic()
-                cached_len, layer_caches = self.prefill_worker.prefill(
-                    prompt_tokens, cancel=cancel
+                cached_len, layer_caches, last_hidden_state = (
+                    self.prefill_worker.prefill(prompt_tokens, cancel=cancel)
                 )
                 if cached_len >= 1:
+                    external_cached_len = cached_len
+                    cached_len = self._apply_external_prefill_tail(
+                        cached_len, len(prompt_tokens), with_mtp=with_mtp
+                    )
+                    if cached_len != external_cached_len or cached_len != len(
+                        prompt_tokens
+                    ):
+                        last_hidden_state = None
                     self.generator.start_sequence_from_cache(
                         prompt_tokens,
                         layer_caches,
+                        last_hidden_state=last_hidden_state,
                         cached_len=cached_len,
                         sampling_params=sampling_params,
                         with_mtp=with_mtp,
@@ -488,10 +500,13 @@ class TileRTScheduler:
                     elapsed = time.monotonic() - prefill_start
                     logger.info(
                         "External prefill injected. rid=%s cached_tokens=%s/%s "
+                        "external_cached_tokens=%s tail_prefill_tokens=%s "
                         "elapsed=%.2fs input_tps=%.2f",
                         rid,
                         cached_len,
                         len(prompt_tokens),
+                        external_cached_len,
+                        max(len(prompt_tokens) - cached_len, 0),
                         elapsed,
                         cached_len / max(elapsed, 1e-9),
                     )
@@ -511,6 +526,17 @@ class TileRTScheduler:
             with_mtp=with_mtp,
         )
 
+    def _apply_external_prefill_tail(
+        self, cached_len: int, prompt_len: int, *, with_mtp: bool
+    ) -> int:
+        return cached_len_after_external_prefill_tail(
+            cached_len,
+            prompt_len,
+            self.server_args.tilert_prefill_tail_tokens,
+            with_mtp=with_mtp,
+            mtp_seq_len=int(getattr(self.generator, "mtp_seq_len", 1)),
+        )
+
     def _run_worker_request(
         self,
         rid: str,
@@ -525,6 +551,7 @@ class TileRTScheduler:
         decode_start_time = 0.0
         last_decode_log_time = request_start_time
         last_decode_log_tokens = 0
+        last_decode_log_steps = 0
 
         try:
             logger.info(
@@ -580,33 +607,87 @@ class TileRTScheduler:
                         decode_elapsed = max(now - decode_start_time, 1e-9)
                         interval = max(now - last_decode_log_time, 1e-9)
                         interval_tokens = output_tokens - last_decode_log_tokens
+                        decode_stats = self.generator.sequence_decode_stats(
+                            since_step=last_decode_log_steps
+                        )
                         logger.info(
-                            "TileRT decode progress. rid=%s output_tokens=%s output_tps=%.2f avg_output_tps=%.2f elapsed=%.2fs",
+                            "TileRT decode progress. rid=%s output_tokens=%s "
+                            "output_tps=%.2f avg_output_tps=%.2f elapsed=%.2fs "
+                            "with_mtp=%s decode_steps=%s avg_accepted=%.2f "
+                            "min_accepted=%s max_accepted=%s recent_steps=%s "
+                            "recent_avg_accepted=%.2f forward_elapsed=%.2fs "
+                            "post_elapsed=%.2fs",
                             rid,
                             output_tokens,
                             interval_tokens / interval,
                             output_tokens / decode_elapsed,
                             decode_elapsed,
+                            decode_stats["with_mtp"],
+                            decode_stats["decode_steps"],
+                            decode_stats["accepted_avg"],
+                            decode_stats["accepted_min"],
+                            decode_stats["accepted_max"],
+                            decode_stats["recent_steps"],
+                            decode_stats["recent_accepted_avg"],
+                            decode_stats["forward_seconds"],
+                            decode_stats["post_seconds"],
                         )
                         last_decode_log_time = now
                         last_decode_log_tokens = output_tokens
+                        last_decode_log_steps = int(decode_stats["decode_steps"])
 
             if cancel.is_set():
+                decode_stats = self.generator.sequence_decode_stats(
+                    since_step=last_decode_log_steps
+                )
                 self.generator.finish_sequence()
                 elapsed = time.monotonic() - request_start_time
                 logger.info(
-                    "Abort TileRT request. rid=%s elapsed=%.2fs",
+                    "Abort TileRT request. rid=%s elapsed=%.2fs with_mtp=%s "
+                    "decode_steps=%s avg_accepted=%.2f min_accepted=%s "
+                    "max_accepted=%s recent_steps=%s recent_avg_accepted=%.2f "
+                    "forward_elapsed=%.2fs post_elapsed=%.2fs",
                     rid,
                     elapsed,
+                    decode_stats["with_mtp"],
+                    decode_stats["decode_steps"],
+                    decode_stats["accepted_avg"],
+                    decode_stats["accepted_min"],
+                    decode_stats["accepted_max"],
+                    decode_stats["recent_steps"],
+                    decode_stats["recent_accepted_avg"],
+                    decode_stats["forward_seconds"],
+                    decode_stats["post_seconds"],
                 )
                 self._worker_events.put(("aborted", rid, None))
             else:
+                decode_stats = self.generator.sequence_decode_stats(
+                    since_step=last_decode_log_steps
+                )
                 self.generator.finish_sequence()
                 elapsed = time.monotonic() - request_start_time
+                decode_elapsed = max(time.monotonic() - decode_start_time, 1e-9)
                 logger.info(
-                    "Finish TileRT request. rid=%s elapsed=%.2fs",
+                    "Finish TileRT request. rid=%s elapsed=%.2fs "
+                    "decode_elapsed=%.2fs output_tokens=%s avg_output_tps=%.2f "
+                    "with_mtp=%s decode_steps=%s avg_accepted=%.2f "
+                    "min_accepted=%s max_accepted=%s recent_steps=%s "
+                    "recent_avg_accepted=%.2f forward_elapsed=%.2fs "
+                    "post_elapsed=%.2fs",
                     rid,
                     elapsed,
+                    decode_elapsed,
+                    decode_stats["output_tokens"],
+                    decode_stats["output_tokens"] / decode_elapsed,
+                    decode_stats["with_mtp"],
+                    decode_stats["decode_steps"],
+                    decode_stats["accepted_avg"],
+                    decode_stats["accepted_min"],
+                    decode_stats["accepted_max"],
+                    decode_stats["recent_steps"],
+                    decode_stats["recent_accepted_avg"],
+                    decode_stats["forward_seconds"],
+                    decode_stats["post_seconds"],
                 )
                 self._worker_events.put(("done", rid, None))
         except Exception as exc:

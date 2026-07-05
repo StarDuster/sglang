@@ -528,6 +528,20 @@ class ServerArgs:
         bool,
         "Disable TileRT MTP. MTP is enabled by default for the TileRT backend.",
     ] = False
+    tilert_index_topk: A[
+        int,
+        (
+            "TileRT DSA index top-k. GLM-5 TileRT defaults to 2048; lower values "
+            "are experimental and depend on native TileRT kernel support."
+        ),
+    ] = 2048
+    tilert_mtp_cache_mode: A[
+        Optional[int],
+        (
+            "Experimental TileRT MTP native cache mode. When omitted, TileRT keeps "
+            "its library default."
+        ),
+    ] = None
     tilert_enable_thinking: A[
         bool,
         "Enable thinking mode when TileRT applies its chat template.",
@@ -547,6 +561,15 @@ class ServerArgs:
             "prefill engine; shorter prompts use TileRT internal prefill."
         ),
     ] = 1024
+    tilert_prefill_tail_tokens: A[
+        int,
+        (
+            "When external TileRT prefill is used, leave up to this many cached "
+            "prompt tokens for TileRT internal prefill before decode. This is "
+            "primarily useful for rebuilding TileRT MTP draft state after a "
+            "main-model-only external KV handoff."
+        ),
+    ] = 0
     tilert_prefill_tp_size: A[
         int,
         "Tensor parallel size of the nested TileRT prefill engine.",
@@ -4431,9 +4454,7 @@ class ServerArgs:
         elif model_arch in ["BailingMoeV2_5ForCausalLM"]:
             self._handle_mamba_radix_cache(model_arch=model_arch)
         elif model_arch in ["NemotronHForCausalLM", "NemotronHPuzzleForCausalLM"]:
-            from sglang.srt.arg_groups.nemotron_h_hook import (
-                apply_nemotron_h_defaults,
-            )
+            from sglang.srt.arg_groups.nemotron_h_hook import apply_nemotron_h_defaults
 
             apply_nemotron_h_defaults(self, model_arch)
         elif model_arch in [
@@ -7157,12 +7178,17 @@ class ServerArgs:
             raise ValueError("--model-impl=tilert does not support PD-Multiplexing.")
         if self.enable_dp_attention:
             raise ValueError("--model-impl=tilert does not support DP attention.")
-
+        if self.tilert_index_topk <= 0:
+            raise ValueError("--tilert-index-topk must be > 0.")
+        if self.tilert_mtp_cache_mode is not None and self.tilert_mtp_cache_mode < 0:
+            raise ValueError("--tilert-mtp-cache-mode must be >= 0 when set.")
         if self.tilert_external_prefill:
             if self.tilert_prefill_tp_size < 1:
                 raise ValueError("--tilert-prefill-tp-size must be >= 1.")
             if not (0.0 < self.tilert_prefill_mem_fraction < 1.0):
                 raise ValueError("--tilert-prefill-mem-fraction must be in (0, 1).")
+            if self.tilert_prefill_tail_tokens < 0:
+                raise ValueError("--tilert-prefill-tail-tokens must be >= 0.")
 
     def check_server_args(self):
         # Check parallel size constraints

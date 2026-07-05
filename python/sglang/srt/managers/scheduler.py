@@ -226,7 +226,11 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
@@ -246,6 +250,7 @@ from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     DynamicGradMode,
+    MultiprocessingSerializer,
     configure_gc_logger,
     configure_logger,
     freeze_gc,
@@ -285,6 +290,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_TILERT_PREFILL_RID_PREFIX = "tilert-prefill-"
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
@@ -455,6 +461,7 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self._tilert_prefill_last_hidden_states: dict[str, torch.Tensor] = {}
 
         if (c := self.tp_worker.model_runner.canary_manager) is not None:
             c.attach_radix_cache(self.tree_cache)
@@ -1647,6 +1654,46 @@ class Scheduler(
         )
 
         return disable_overlap_for_batch or need_grammar_sync
+
+    @staticmethod
+    def _is_tilert_prefill_req(req) -> bool:
+        rid = getattr(req, "rid", None)
+        return isinstance(rid, str) and rid.startswith(_TILERT_PREFILL_RID_PREFIX)
+
+    def _prepare_tilert_prefill_capture(self, batch: ScheduleBatch) -> None:
+        if (
+            not batch.forward_mode.is_extend()
+            or batch.capture_hidden_mode is not None
+            or not any(self._is_tilert_prefill_req(req) for req in batch.reqs)
+        ):
+            return
+        batch.capture_hidden_mode = CaptureHiddenMode.LAST
+        batch.return_hidden_states_before_norm = True
+
+    def _stash_tilert_prefill_last_hidden_states(
+        self,
+        batch: ScheduleBatch,
+        result: Union[GenerationBatchResult, EmbeddingBatchResult],
+    ) -> None:
+        if not any(self._is_tilert_prefill_req(req) for req in batch.reqs):
+            return
+
+        logits_output = getattr(result, "logits_output", None)
+        hidden_states = getattr(logits_output, "hidden_states", None)
+        if hidden_states is None:
+            logger.warning("TileRT prefill hidden-state capture produced no tensor")
+            return
+
+        for i, req in enumerate(batch.reqs):
+            if not self._is_tilert_prefill_req(req):
+                continue
+            if i >= hidden_states.shape[0]:
+                logger.warning(
+                    "TileRT prefill hidden-state capture missing row for rid=%s",
+                    req.rid,
+                )
+                continue
+            self._tilert_prefill_last_hidden_states[req.rid] = hidden_states[i].detach()
 
     @scheduler_nvtx_method("scheduler.process_input_requests")
     def process_input_requests(self, recv_reqs: List):
@@ -3198,6 +3245,8 @@ class Scheduler(
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
 
+        self._prepare_tilert_prefill_capture(batch)
+
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             for req in batch.reqs:
@@ -3444,6 +3493,7 @@ class Scheduler(
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
+            self._stash_tilert_prefill_last_hidden_states(batch, result)
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
             elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3836,6 +3886,12 @@ class Scheduler(
 
         stage_prefill_kv(self, token_ids, out_path)
 
+    def tilert_export_prefill_kv(self, token_ids, rid=None):
+        # Returns CUDA tensors serialized by the generic RPC handler below.
+        from sglang.srt.managers.tilert_prefill import export_prefill_kv
+
+        return export_prefill_kv(self, token_ids, rid=rid)
+
     def handle_rpc_request(self, recv_req: RpcReqInput):
         # Handle RPC requests
         logger.info(
@@ -3844,19 +3900,32 @@ class Scheduler(
 
         success = True
         exec = None
+        result = None
         try:
             func = getattr(self, recv_req.method)
             if recv_req.parameters is not None:
-                func(**recv_req.parameters)
+                result = func(**recv_req.parameters)
             else:
-                func()
+                result = func()
         except Exception as e:
             success = False
             exec = e
             logger.error(f"Failed to call rpc {recv_req.method}: {str(e)}")
 
-        barrier()
-        return RpcReqOutput(success=success, message="" if not exec else str(exec))
+        if recv_req.method != "tilert_stage_prefill_kv":
+            barrier()
+
+        serialized_result = None
+        if success and result is not None:
+            from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+            monkey_patch_torch_reductions()
+            serialized_result = MultiprocessingSerializer.serialize(result)
+        return RpcReqOutput(
+            success=success,
+            message="" if not exec else str(exec),
+            serialized_result=serialized_result,
+        )
 
     def abort_request(self, recv_req: AbortReq):
         if (chunked_req := self.chunked_req) is not None:
