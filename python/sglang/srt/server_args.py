@@ -554,6 +554,15 @@ class ServerArgs:
             "prefill. Requires --model-impl=tilert."
         ),
     ] = False
+    tilert_require_external_prefill: A[
+        bool,
+        (
+            "Require every prompt token to be prefetched by the nested SGLang "
+            "engine. When enabled, TileRT internal prefill fallback is disabled "
+            "and requests fail if external prefill is unavailable or cannot "
+            "cover the full prompt."
+        ),
+    ] = False
     tilert_prefill_min_tokens: A[
         int,
         (
@@ -586,6 +595,21 @@ class ServerArgs:
             "longest prompt that can be fully externally prefilled."
         ),
     ] = 0.88
+    tilert_prefill_max_total_tokens: A[
+        Optional[int],
+        Arg(
+            help=(
+                "Upper bound for the nested TileRT prefill engine KV pool. "
+                "When set, the nested engine still profiles available memory "
+                "from --tilert-prefill-mem-fraction, but allocates no more "
+                "than this many total KV tokens. Use this with a higher "
+                "--tilert-prefill-mem-fraction to make external prefill "
+                "capacity explicit without letting the nested engine consume "
+                "all profiled headroom." + f"\n\n{human_readable_int.__doc__}"
+            ),
+            type_parser=human_readable_int,
+        ),
+    ] = None
     tilert_prefill_staging_dir: A[
         Optional[str],
         (
@@ -7187,8 +7211,26 @@ class ServerArgs:
                 raise ValueError("--tilert-prefill-tp-size must be >= 1.")
             if not (0.0 < self.tilert_prefill_mem_fraction < 1.0):
                 raise ValueError("--tilert-prefill-mem-fraction must be in (0, 1).")
+            if (
+                self.tilert_prefill_max_total_tokens is not None
+                and self.tilert_prefill_max_total_tokens <= 1024
+            ):
+                raise ValueError(
+                    "--tilert-prefill-max-total-tokens must be > 1024 when set."
+                )
             if self.tilert_prefill_tail_tokens < 0:
                 raise ValueError("--tilert-prefill-tail-tokens must be >= 0.")
+        if self.tilert_require_external_prefill:
+            if not self.tilert_external_prefill:
+                raise ValueError(
+                    "--tilert-require-external-prefill requires "
+                    "--tilert-external-prefill."
+                )
+            if self.tilert_prefill_tail_tokens != 0:
+                raise ValueError(
+                    "--tilert-prefill-tail-tokens must be 0 when "
+                    "--tilert-require-external-prefill is set."
+                )
 
     def check_server_args(self):
         # Check parallel size constraints

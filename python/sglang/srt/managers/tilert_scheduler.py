@@ -38,7 +38,10 @@ from sglang.srt.managers.scheduler_components.ipc_channels import SchedulerIpcCh
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
-from sglang.srt.managers.tilert_utils import cached_len_after_external_prefill_tail
+from sglang.srt.managers.tilert_utils import (
+    cached_len_after_external_prefill_tail,
+    required_external_prefill_error,
+)
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -144,9 +147,11 @@ class TileRTScheduler:
 
             self.prefill_worker = TileRTPrefillWorker(server_args)
             logger.info(
-                "TileRT external prefill engine launching. tp=%s mem_fraction=%s",
+                "TileRT external prefill engine launching. tp=%s mem_fraction=%s "
+                "max_total_tokens=%s",
                 server_args.tilert_prefill_tp_size,
                 server_args.tilert_prefill_mem_fraction,
+                server_args.tilert_prefill_max_total_tokens,
             )
         self.stop_token_ids = set(getattr(self.generator, "stop_token_ids", set()))
         self.waiting_queue: Deque[Req] = deque()
@@ -471,11 +476,16 @@ class TileRTScheduler:
     ) -> None:
         """Start the TileRT sequence, preferring SGLang external prefill."""
         with_mtp = not self.server_args.tilert_disable_mtp
+        require_external_prefill = self.server_args.tilert_require_external_prefill
         if (
             self.prefill_worker is not None
             and len(prompt_tokens) >= self.server_args.tilert_prefill_min_tokens
         ):
             try:
+                if require_external_prefill:
+                    self.prefill_worker.ensure_full_prompt_capacity(
+                        len(prompt_tokens), cancel=cancel
+                    )
                 prefill_start = time.monotonic()
                 cached_len, layer_caches, last_hidden_state = (
                     self.prefill_worker.prefill(prompt_tokens, cancel=cancel)
@@ -485,6 +495,12 @@ class TileRTScheduler:
                     cached_len = self._apply_external_prefill_tail(
                         cached_len, len(prompt_tokens), with_mtp=with_mtp
                     )
+                    if require_external_prefill:
+                        error = required_external_prefill_error(
+                            cached_len, len(prompt_tokens)
+                        )
+                        if error is not None:
+                            raise RuntimeError(error)
                     if cached_len != external_cached_len or cached_len != len(
                         prompt_tokens
                     ):
@@ -511,15 +527,27 @@ class TileRTScheduler:
                         cached_len / max(elapsed, 1e-9),
                     )
                     return
+                if require_external_prefill:
+                    raise RuntimeError(
+                        "External prefill cached no prompt tokens; TileRT internal "
+                        "prefill is disabled."
+                    )
                 logger.warning(
                     "External prefill cached nothing; falling back. rid=%s", rid
                 )
             except Exception:
+                if require_external_prefill:
+                    raise
                 logger.exception(
                     "External prefill failed; falling back to TileRT internal "
                     "prefill. rid=%s",
                     rid,
                 )
+        elif require_external_prefill:
+            raise RuntimeError(
+                "External prefill is required for TileRT requests, but this "
+                "prompt was not routed to the external prefill engine."
+            )
         self.generator.start_sequence(
             prompt_tokens,
             sampling_params=sampling_params,

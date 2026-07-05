@@ -18,3 +18,12 @@ def cached_len_after_external_prefill_tail(
         target_cached_len = max(1, (target_cached_len // mtp_seq_len) * mtp_seq_len)
 
     return min(target_cached_len, prompt_len)
+
+
+def required_external_prefill_error(cached_len: int, prompt_len: int) -> str | None:
+    if cached_len == prompt_len:
+        return None
+    return (
+        "External prefill did not cover the full prompt "
+        f"({cached_len}/{prompt_len} tokens); TileRT internal prefill is disabled."
+    )

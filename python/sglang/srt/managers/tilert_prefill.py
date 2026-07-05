@@ -64,7 +64,7 @@ def _external_prefill_warmup_len(min_tokens: int, max_prefill_tokens: int) -> in
 def _build_prefill_engine_kwargs(
     server_args: ServerArgs, prefill_model_path: str
 ) -> dict:
-    return {
+    kwargs = {
         "model_path": prefill_model_path,
         "trust_remote_code": server_args.trust_remote_code,
         "tp_size": server_args.tilert_prefill_tp_size,
@@ -82,6 +82,13 @@ def _build_prefill_engine_kwargs(
         "disable_cuda_graph": True,
         "log_level": "warning",
     }
+    max_total_tokens = getattr(server_args, "tilert_prefill_max_total_tokens", None)
+    if max_total_tokens is not None:
+        kwargs["max_total_tokens"] = max_total_tokens
+        prefill_token_budget = max(1, max_total_tokens - 1024)
+        kwargs["max_prefill_tokens"] = prefill_token_budget
+        kwargs["chunked_prefill_size"] = min(16384, prefill_token_budget)
+    return kwargs
 
 
 def _collect_prefill_kv(
@@ -269,6 +276,17 @@ class TileRTPrefillWorker:
             raise RuntimeError(
                 "Failed to launch TileRT prefill engine"
             ) from self._init_error
+
+    def ensure_full_prompt_capacity(
+        self, prompt_len: int, cancel: Optional[threading.Event] = None
+    ) -> None:
+        self._ensure_ready(cancel)
+        if prompt_len > self.max_prefill_tokens:
+            raise RuntimeError(
+                "External prefill capacity is "
+                f"{self.max_prefill_tokens} tokens, but prompt has "
+                f"{prompt_len} tokens; TileRT internal prefill is disabled."
+            )
 
     def _engine_thread(self) -> None:
         try:

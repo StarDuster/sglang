@@ -1,4 +1,7 @@
-from sglang.srt.managers.tilert_utils import cached_len_after_external_prefill_tail
+from sglang.srt.managers.tilert_utils import (
+    cached_len_after_external_prefill_tail,
+    required_external_prefill_error,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -41,3 +44,15 @@ def test_external_prefill_tail_keeps_at_least_one_cached_token():
         )
         == 1
     )
+
+
+def test_required_external_prefill_accepts_full_prompt_cache():
+    assert required_external_prefill_error(128, 128) is None
+
+
+def test_required_external_prefill_rejects_partial_prompt_cache():
+    error = required_external_prefill_error(64, 128)
+
+    assert error is not None
+    assert "64/128" in error
+    assert "TileRT internal prefill is disabled" in error
