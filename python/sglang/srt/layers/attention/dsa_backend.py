@@ -1888,19 +1888,18 @@ class DeepseekSparseAttnBackend(
             q_nope = q_all[:, :, : layer.v_head_dim]
             q_rope = q_all[:, :, layer.v_head_dim :]
 
-        # Align topk_indices with q dimensions
-        # This handles cases where q is padded (TP + partial DP attention)
-        if topk_indices is not None:
-            topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
-
         # NOTE(dark): here, we use page size = 1
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
         if envs.SGLANG_DSA_FUSE_TOPK.get():
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
+                if topk_indices is not None:
+                    topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
                 topk_indices_offset = metadata.topk_indices_offset
                 assert topk_indices_offset is not None
                 mask = topk_indices != -1
@@ -1919,6 +1918,7 @@ class DeepseekSparseAttnBackend(
                     topk_indices=topk_indices,
                     extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                     page_size=1,
+                    output_num_tokens=q_nope.shape[0],
                 )
 
         # todo hisparse: to cover more backends
@@ -2665,11 +2665,9 @@ class DeepseekSparseAttnBackend(
         else:
             q_all = q.view(-1, layer.tp_q_head_num, layer.head_dim)
 
-        # Align topk_indices with q dimensions
-        if topk_indices is not None:
-            topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
-
         if envs.SGLANG_DSA_FUSE_TOPK.get():
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -2677,8 +2675,11 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 extend_lens_cpu=metadata.dsa_extend_seq_lens_list,
                 page_size=1,
+                output_num_tokens=q.shape[0],
             )
         else:
+            if topk_indices is not None:
+                topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
             page_table_1 = transform_index_page_table_decode(
                 page_table=metadata.page_table_1,
                 topk_indices=topk_indices,

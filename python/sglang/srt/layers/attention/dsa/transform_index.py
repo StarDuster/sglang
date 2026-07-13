@@ -13,6 +13,33 @@ def transform_index_page_table_decode(**kwargs):
     return transform_index_page_table_decode_ref(**kwargs)
 
 
+def _allocate_prefill_result(
+    topk_indices: torch.Tensor,
+    real_num_tokens: int,
+    output_num_tokens: Optional[int],
+) -> torch.Tensor:
+    padded_num_tokens = topk_indices.shape[0]
+    if output_num_tokens is None:
+        output_num_tokens = padded_num_tokens
+    assert real_num_tokens <= padded_num_tokens, (
+        f"sum(extend_lens_cpu) ({real_num_tokens}) exceeds "
+        f"topk_indices rows ({padded_num_tokens})"
+    )
+    assert padded_num_tokens <= output_num_tokens, (
+        f"topk_indices rows ({padded_num_tokens}) exceeds "
+        f"output_num_tokens ({output_num_tokens})"
+    )
+
+    result = torch.empty(
+        (output_num_tokens, topk_indices.shape[1]),
+        dtype=torch.int32,
+        device=topk_indices.device,
+    )
+    if real_num_tokens < output_num_tokens:
+        result[real_num_tokens:].fill_(-1)
+    return result
+
+
 @triton.jit
 def transform_index_page_table_decode_kernel(
     page_table_ptr: torch.Tensor,
@@ -74,11 +101,13 @@ def transform_index_page_table_prefill_fast(
     topk_indices: torch.Tensor,
     extend_lens_cpu: List[int],
     page_size: int = 1,
+    output_num_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     # TODO(baizhou): can be implemented with another triton kernel
     assert page_size == 1
-    result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert len(extend_lens_cpu) == page_table.shape[0]
+    real_num_tokens = sum(extend_lens_cpu)
+    result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     offset = 0
     for i, l in enumerate(extend_lens_cpu):
         transform_index_page_table_decode_fast(
@@ -87,7 +116,6 @@ def transform_index_page_table_prefill_fast(
             result=result[offset : offset + l],
         )
         offset += l
-    assert offset == topk_indices.shape[0]
     return result
 
 
@@ -117,10 +145,12 @@ def transform_index_page_table_prefill_ref(
     topk_indices: torch.Tensor,
     extend_lens_cpu: List[int],
     page_size: int = 1,
+    output_num_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert len(extend_lens_cpu) == page_table.shape[0]
+    real_num_tokens = sum(extend_lens_cpu)
+    result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     offset = 0
     for i, l in enumerate(extend_lens_cpu):
         transform_index_page_table_decode_ref(
@@ -129,7 +159,6 @@ def transform_index_page_table_prefill_ref(
             result=result[offset : offset + l],
         )
         offset += l
-    assert offset == topk_indices.shape[0]
     return result
 
 
