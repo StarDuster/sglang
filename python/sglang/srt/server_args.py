@@ -3065,7 +3065,9 @@ class ServerArgs:
     ] = 4
     weight_loader_drop_cache_after_load: A[
         bool,
-        "Call posix_fadvise(DONTNEED) on each safetensors shard after loading it.",
+        "After all ranks finish loading, call posix_fadvise(DONTNEED) on every "
+        "safetensors shard once per node to evict checkpoint pages from the "
+        "host file cache before runtime host-memory allocation (e.g. HiCache).",
         NS("model"),
     ] = False
     remote_instance_weight_loader_seed_instance_ip: A[

@@ -942,22 +942,27 @@ def _prefetch_all_checkpoints(
     threading.Thread(target=_run_prefetch, daemon=True).start()
 
 
-def _drop_file_cache_after_load(path: str) -> None:
-    """Release of checkpoint pages after weights have been copied out. Used to avoid CPU OOM in RL."""
+def drop_file_cache_after_load(paths: Iterable[str]) -> int:
+    """Advise the kernel to evict clean checkpoint pages after weights have
+    been copied out. Returns the number of files successfully advised."""
     posix_fadvise = getattr(os, "posix_fadvise", None)
     dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
     if posix_fadvise is None or dontneed is None:
-        return
+        return 0
 
-    fd = None
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        posix_fadvise(fd, 0, 0, dontneed)
-    except OSError as e:
-        logger.debug("Failed to drop file cache for %s: %s", path, e)
-    finally:
-        if fd is not None:
-            os.close(fd)
+    advised = 0
+    for path in paths:
+        fd = None
+        try:
+            fd = os.open(path, os.O_RDONLY)
+            posix_fadvise(fd, 0, 0, dontneed)
+            advised += 1
+        except OSError as e:
+            logger.debug("Failed to drop file cache for %s: %s", path, e)
+        finally:
+            if fd is not None:
+                os.close(fd)
+    return advised
 
 
 def safetensors_weights_iterator(
@@ -965,7 +970,6 @@ def safetensors_weights_iterator(
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
-    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -993,8 +997,6 @@ def safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 for name in f.keys():
                     yield name, f.get_tensor(name)
-        if drop_cache_after_load:
-            _drop_file_cache_after_load(st_file)
 
 
 def fastsafetensors_weights_iterator(
@@ -1056,7 +1058,6 @@ def multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
-    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-Thread iterate over the weights in the model safetensor files."""
     enable_tqdm = (
@@ -1071,7 +1072,7 @@ def multi_thread_safetensors_weights_iterator(
             with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
                 result = {k: f.get_tensor(k) for k in f.keys()}
 
-        return st_file, result
+        return result
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
@@ -1088,12 +1089,10 @@ def multi_thread_safetensors_weights_iterator(
             futures_iter = concurrent.futures.as_completed(futures)
 
         for future in futures_iter:
-            st_file, state_dict = future.result()
+            state_dict = future.result()
             for name, param in state_dict.items():
                 yield name, param
             del state_dict
-            if drop_cache_after_load:
-                _drop_file_cache_after_load(st_file)
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
@@ -1102,7 +1101,6 @@ def buffered_multi_thread_safetensors_weights_iterator(
     disable_mmap: bool = False,
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
-    drop_cache_after_load: bool = False,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -1158,10 +1156,6 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 for name in sorted(state_dict.keys()):
                     yield name, state_dict[name]
                 del state_dict
-                if drop_cache_after_load:
-                    # DONTNEED reduces page-cache pressure after copying weights,
-                    # but later mmap-backed tensor access may fault pages again.
-                    _drop_file_cache_after_load(st_file)
                 pbar.update(1)
 
 

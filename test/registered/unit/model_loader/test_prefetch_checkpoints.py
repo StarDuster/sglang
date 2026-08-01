@@ -16,10 +16,12 @@ import safetensors.torch
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+from sglang.srt.model_executor.model_runner_components.load_model_utils import (
+    finalize_model_loading,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     _prefetch_all_checkpoints,
-    buffered_multi_thread_safetensors_weights_iterator,
     safetensors_weights_iterator,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -199,27 +201,152 @@ class TestPrefetchCheckpoints(CustomTestCase):
 
         self.assertEqual(sorted(loaded_paths), sorted(paths[1::3]))
 
-    @patch("torch.distributed.is_initialized", return_value=False)
-    def test_buffered_loader_drops_cache_after_each_loaded_shard(self, _):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            paths = self._create_safetensors_files(tmpdir, num_shards=3)
-
-            with patch(
-                "sglang.srt.model_loader.weight_utils._drop_file_cache_after_load"
-            ) as drop_cache:
-                loaded = list(
-                    buffered_multi_thread_safetensors_weights_iterator(
-                        paths,
-                        max_workers=2,
-                        drop_cache_after_load=True,
-                    )
-                )
-
-            self.assertEqual(len(loaded), 6)
-            self.assertEqual(
-                [call.args[0] for call in drop_cache.call_args_list],
-                paths,
+    def test_final_cache_drop_revisits_all_loaded_shards(self):
+        paths = ["model-00001.safetensors", "model-00002.safetensors"]
+        dropped_paths = []
+        loader = DefaultModelLoader(
+            LoadConfig(
+                load_format=LoadFormat.SAFETENSORS,
+                model_loader_extra_config={"enable_multithread_load": True},
             )
+        )
+        server_args = SimpleNamespace(
+            weight_loader_disable_mmap=False,
+            weight_loader_prefetch_checkpoints=False,
+            weight_loader_prefetch_num_threads=4,
+            weight_loader_drop_cache_after_load=True,
+        )
+
+        with (
+            patch.object(
+                DefaultModelLoader,
+                "_prepare_weights",
+                return_value=("/dummy", paths, True),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.get_server_args",
+                return_value=server_args,
+            ),
+            patch(
+                "sglang.srt.model_loader.loader."
+                "buffered_multi_thread_safetensors_weights_iterator",
+                return_value=iter([]),
+            ),
+            patch(
+                "sglang.srt.model_loader.loader.drop_file_cache_after_load",
+                side_effect=lambda values: (
+                    dropped_paths.extend(values) or len(dropped_paths)
+                ),
+            ) as drop_cache,
+        ):
+            source = SimpleNamespace(
+                model_or_path="/dummy",
+                revision=None,
+                fall_back_to_pt=False,
+                model_config=None,
+                prefix="",
+            )
+            list(loader._get_weights_iterator(source))
+            self.assertEqual(loader.drop_safetensors_cache_after_load(), len(paths))
+            self.assertEqual(loader.drop_safetensors_cache_after_load(), 0)
+
+        drop_cache.assert_called_once()
+        self.assertCountEqual(dropped_paths, paths)
+
+    def test_final_cache_drop_runs_once_per_node_between_barriers(self):
+        events = []
+        loader = SimpleNamespace(
+            drop_safetensors_cache_after_load=lambda: events.append("drop")
+        )
+        world_group = SimpleNamespace(
+            local_rank=0,
+            barrier=lambda: events.append("world_barrier"),
+        )
+
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner_components."
+                "load_model_utils.dist_barrier_after_load",
+                side_effect=lambda **_: events.append("tp_barrier"),
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner_components."
+                "load_model_utils.get_world_group",
+                return_value=world_group,
+            ),
+        ):
+            finalize_model_loading(
+                loader=loader,
+                drop_cache_after_load=True,
+                elastic_ep_backend=None,
+                tp_rank=0,
+            )
+
+        self.assertEqual(
+            events,
+            ["tp_barrier", "world_barrier", "drop", "world_barrier"],
+        )
+
+    def test_final_cache_drop_skips_non_leader(self):
+        events = []
+        loader = SimpleNamespace(
+            drop_safetensors_cache_after_load=lambda: events.append("drop")
+        )
+        world_group = SimpleNamespace(
+            local_rank=1,
+            barrier=lambda: events.append("world_barrier"),
+        )
+
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner_components."
+                "load_model_utils.dist_barrier_after_load",
+                side_effect=lambda **_: events.append("tp_barrier"),
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner_components."
+                "load_model_utils.get_world_group",
+                return_value=world_group,
+            ),
+        ):
+            finalize_model_loading(
+                loader=loader,
+                drop_cache_after_load=True,
+                elastic_ep_backend=None,
+                tp_rank=1,
+            )
+
+        self.assertEqual(
+            events,
+            ["tp_barrier", "world_barrier", "world_barrier"],
+        )
+
+    def test_disabled_final_cache_drop_keeps_original_barrier(self):
+        events = []
+        loader = SimpleNamespace(
+            drop_safetensors_cache_after_load=lambda: events.append("drop")
+        )
+
+        with (
+            patch(
+                "sglang.srt.model_executor.model_runner_components."
+                "load_model_utils.dist_barrier_after_load",
+                side_effect=lambda **_: events.append("tp_barrier"),
+            ),
+            patch(
+                "sglang.srt.model_executor.model_runner_components."
+                "load_model_utils.get_world_group"
+            ) as get_world_group,
+        ):
+            finalize_model_loading(
+                loader=loader,
+                drop_cache_after_load=False,
+                elastic_ep_backend=None,
+                tp_rank=0,
+            )
+
+        self.assertEqual(events, ["tp_barrier"])
+        get_world_group.assert_not_called()
 
 
 class TestPrefetchDispatch(CustomTestCase):

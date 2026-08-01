@@ -124,7 +124,7 @@ from sglang.srt.model_executor.model_runner_components.layer_setup import (
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     build_load_config,
-    dist_barrier_after_load,
+    finalize_model_loading,
     load_kv_cache_scales,
     load_model_with_memory_saver,
     maybe_downgrade_dtype_for_legacy_gpu,
@@ -1094,7 +1094,9 @@ class ModelRunner:
             logger,
         )
 
-        dist_barrier_after_load(
+        finalize_model_loading(
+            loader=self.loader,
+            drop_cache_after_load=self.server_args.weight_loader_drop_cache_after_load,
             elastic_ep_backend=self.server_args.elastic_ep_backend,
             tp_rank=self.ps.tp_rank,
             is_ep_joiner=self.server_args.is_ep_joiner,

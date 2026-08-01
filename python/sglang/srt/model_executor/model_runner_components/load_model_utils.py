@@ -17,9 +17,9 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_WEIGHTS
 from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
-from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed import get_tp_group, get_world_group
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.model_loader.loader import get_model_loader
+from sglang.srt.model_loader.loader import BaseModelLoader, get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
     trigger_init_weights_send_group_for_remote_instance_request,
@@ -319,3 +319,31 @@ def dist_barrier_after_load(
             raise ValueError(
                 f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+
+def finalize_model_loading(
+    *,
+    loader: BaseModelLoader,
+    drop_cache_after_load: bool,
+    elastic_ep_backend: Optional[str],
+    tp_rank: int,
+    is_ep_joiner: bool = False,
+) -> None:
+    """Synchronize model loading and perform the final node-local cache sweep."""
+    dist_barrier_after_load(
+        elastic_ep_backend=elastic_ep_backend,
+        tp_rank=tp_rank,
+        is_ep_joiner=is_ep_joiner,
+    )
+
+    if not drop_cache_after_load or is_ep_joiner:
+        return
+
+    # File cache is shared by every process on a node. Wait for all model
+    # ranks to release mmap-backed tensors, sweep once per node, then keep all
+    # ranks out of host-cache allocation until every node has finished.
+    world_group = get_world_group()
+    world_group.barrier()
+    if world_group.local_rank == 0:
+        loader.drop_safetensors_cache_after_load()
+    world_group.barrier()

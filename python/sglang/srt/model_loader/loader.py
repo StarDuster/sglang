@@ -97,6 +97,7 @@ from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    drop_file_cache_after_load,
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
@@ -354,6 +355,13 @@ class BaseModelLoader(ABC):
         """Load a model with the given configurations."""
         raise NotImplementedError
 
+    def drop_safetensors_cache_after_load(self) -> int:
+        """Evict clean checkpoint pages from the host file cache.
+
+        Loaders that read safetensors shards through the page cache override
+        this. Returns the number of files advised."""
+        return 0
+
 
 class DefaultModelLoader(BaseModelLoader):
     """Model loader that can load different file types from disk."""
@@ -397,6 +405,7 @@ class DefaultModelLoader(BaseModelLoader):
 
     def __init__(self, load_config: LoadConfig):
         super().__init__(load_config)
+        self._safetensors_files_for_final_cache_drop: set[str] = set()
         extra_config = load_config.model_loader_extra_config
         allowed_keys = {"enable_multithread_load", "num_threads"}
         unexpected_keys = set(extra_config.keys()) - allowed_keys
@@ -576,9 +585,11 @@ class DefaultModelLoader(BaseModelLoader):
             weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
             weight_loader_prefetch = server_args.weight_loader_prefetch_checkpoints
             prefetch_num_threads = server_args.weight_loader_prefetch_num_threads
-            weight_loader_drop_cache_after_load = (
+            if (
                 server_args.weight_loader_drop_cache_after_load
-            )
+                and self.load_config.load_format != LoadFormat.FASTSAFETENSORS
+            ):
+                self._safetensors_files_for_final_cache_drop.update(hf_weights_files)
 
             # Prefetch and multi-threaded loading both read the same shards,
             # competing for I/O on shared/network storage. When prefetch is
@@ -621,7 +632,6 @@ class DefaultModelLoader(BaseModelLoader):
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
-                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
@@ -629,7 +639,6 @@ class DefaultModelLoader(BaseModelLoader):
                     disable_mmap=weight_loader_disable_mmap,
                     prefetch=weight_loader_prefetch,
                     prefetch_num_threads=prefetch_num_threads,
-                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
 
         else:
@@ -652,6 +661,27 @@ class DefaultModelLoader(BaseModelLoader):
             self.counter_before_loading_weights = time.perf_counter()
         # Apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
+
+    def drop_safetensors_cache_after_load(self) -> int:
+        """Advise DONTNEED for every shard read through the page cache.
+
+        Only effective after all ranks have released their checkpoint
+        mappings; the caller synchronizes ranks before invoking this."""
+        paths = self._safetensors_files_for_final_cache_drop
+        if not paths:
+            return 0
+
+        start = time.perf_counter()
+        total = len(paths)
+        advised = drop_file_cache_after_load(paths)
+        paths.clear()
+        logger.info(
+            "Final safetensors cache drop advised for %d/%d shards in %.2fs.",
+            advised,
+            total,
+            time.perf_counter() - start,
+        )
+        return advised
 
     @classmethod
     def _filter_mtp_weights(
