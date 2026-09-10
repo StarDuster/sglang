@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.utils import (
     compute_mamba_state_slice_byte_blocks,
     resolve_dcp_dst_entry_indices,
     slice_dsa_tail_dst_ptrs_for_pp,
+    validate_dsv41_c2_state_layout,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_parallel, get_schedule
@@ -420,6 +421,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.has_c2_state = 2 in (getattr(args, "mla_compression_ratios", None) or ())
         self.transfer_source_rank = (
             self.kv_args.pp_rank * get_parallel().tp_size + self.kv_args.engine_rank
         )
@@ -2534,6 +2536,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             dst_lids = dst_state_layer_ids[i] if i < len(dst_state_layer_ids) else []
             comp_notif = f"{notif}_{i}"
+
+            if st == StateType.C128_STATE and self.has_c2_state:
+                validate_dsv41_c2_state_layout(src_lens, dst_lens)
 
             if st == StateType.MAMBA:
                 if self.attn_tp_size != decode_tp_size:
