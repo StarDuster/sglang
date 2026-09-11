@@ -328,7 +328,7 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
                 "DP=1 and CP=1. Both servers must enable DSpark with the same "
-                "block size and TP size."
+                "block size."
             )
 
     from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
