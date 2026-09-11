@@ -52,7 +52,8 @@ class TestDSV41DSparkPD(CustomTestCase):
         cases += [
             ("prefill_only", None, layout, 4, False),
             ("decode_only_or_old_prefill", layout, None, 4, False),
-            ("tp_mismatch", layout, layout, 2, False),
+            ("prefill_tp2_decode_tp4", layout, layout, 2, True),
+            ("prefill_tp8_decode_tp4", layout, layout, 8, True),
         ]
         for name, local, peer, tp_size, supported in cases:
             with self.subTest(name=name):
