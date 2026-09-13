@@ -1584,7 +1584,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and len(dst_indices_local) == 0
                 ):
                     continue
-                if st == StateType.C128_STATE and self.has_c2_state:
+                if st == StateType.DSV4_REQUEST_STATE and self.has_c2_state:
                     try:
                         validate_dsv41_c2_state_layout(src_item_lens, dst_item_lens)
                     except ValueError as error:
