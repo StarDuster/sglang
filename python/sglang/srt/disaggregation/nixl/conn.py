@@ -2396,7 +2396,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             dst_lids = dst_state_layer_ids[i] if i < len(dst_state_layer_ids) else []
             comp_notif = f"{notif}_{i}"
 
-            if st == StateType.C128_STATE and self.has_c2_state:
+            if st == StateType.DSV4_REQUEST_STATE and self.has_c2_state:
                 validate_dsv41_c2_state_layout(src_lens, dst_lens)
 
             if st == StateType.MAMBA:

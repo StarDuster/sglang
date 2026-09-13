@@ -139,7 +139,7 @@ def validate_dsv41_c2_state_layout(
 
 
 def get_dsv4_request_state_indices(pool, req_pool_idx: int, seq_len: int) -> np.ndarray:
-    """PD transfer indices of the request-scoped state component (C128_STATE).
+    """PD transfer indices of the request-scoped component (DSV4_REQUEST_STATE).
 
     The component carries the c128 ring, whose item is one c128 page (or the
     single online row), or the ratio-2 pair ring, whose item is one request's
