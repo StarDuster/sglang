@@ -23,12 +23,19 @@ class TestC2Layout(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "matching C2 state layouts"):
             validate_dsv41_c2_state_layout([8192] * 3, [32768] * 3)
 
-    def test_c2_indices_with_absent_c128_pool(self):
-        # Index selection needs only the pool registry, not GPU buffers.
+    def test_c2_indices_with_empty_c128_pool(self):
+        # Build the real layer registry without allocating inference buffers.
         pool = DeepSeekV4TokenToKVPool.__new__(DeepSeekV4TokenToKVPool)
+        pool._stage_start = 0
+        pool._stage_end = 3
+        pool.compression_ratios = [1, 2, 2]
+        pool.kv_source_layers = [0, 1]
+        pool.sources_by_ratio = pool._collect_sources_by_ratio()
+        empty_pool = DeepSeekV4SingleKVPool.__new__(DeepSeekV4SingleKVPool)
+        empty_pool.kv_buffer = []
         pool.kv_pools = {
-            4: None,
-            128: None,
+            4: empty_pool,
+            128: empty_pool,
             2: DeepSeekV4SingleKVPool.__new__(DeepSeekV4SingleKVPool),
         }
         for length in (127, 129, 1047999):
