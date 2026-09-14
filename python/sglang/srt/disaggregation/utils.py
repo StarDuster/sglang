@@ -146,13 +146,13 @@ def get_dsv4_request_state_indices(pool, req_pool_idx: int, seq_len: int) -> np.
     whole ring; there only an odd prefix leaves a pending half-pair that decode
     reads, so an even prefix ships nothing.
     """
-    if pool.kv_pools.get(128) is not None:
+    if pool.sources_by_ratio.get(128):
         online = is_dsv4_c128_online_enabled()
         ring_size = 1 if online else pool.get_ring_size(128)
         return get_dsv4_c128_state_indices(
             req_pool_idx, seq_len, online=online, ring_size=ring_size
         )
-    assert pool.kv_pools.get(2) is not None, (
+    assert pool.sources_by_ratio.get(2), (
         "the request-scoped state component holds the c128 or the ratio-2 ring"
     )
     if seq_len % 2 == 0:
