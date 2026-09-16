@@ -55,7 +55,8 @@ def _backend(core, pool, req_to_token):
     backend.forward_metadata = SimpleNamespace(core_metadata=core, late_layer_tail=None)
     backend.token_to_kv_pool = pool
     backend.req_to_token = req_to_token
-    backend.candidate_masks = None
+    backend.forward_metadata.candidate_metadata = None
+    backend.tail_forward_metadata = None
     return backend
 
 
@@ -252,6 +253,83 @@ class TestPrefillIndexerKernelPath(_PrefillIndexerFixture):
                         msg=f"{ratio=} request {b} row {i}: overlap {overlap}",
                     )
                 tok += e
+
+
+class TestPrefillIndexerChunking(_PrefillIndexerFixture):
+    def _dense(self, st, *, source=False, consume=None, tails=None, cp=False):
+        from sglang.srt.layers.attention.dsv4.candidate_torch import CandidateMasks
+
+        core, pages, raw = st.buffers()
+        backend = _backend(core, st.pool, st.req_to_token)
+        if consume is not None:
+            backend.forward_metadata.candidate_metadata = CandidateMasks(
+                request_masks=consume
+            )
+        if tails is not None:
+            backend.tail_forward_metadata = SimpleNamespace(
+                late_layer_tail=SimpleNamespace(
+                    extend_seq_lens_cpu=tails,
+                    cp_metadata=object() if cp else None,
+                )
+            )
+        indexer = _Indexer(st.q, st.weights, TOPK)
+        indexer.is_candidate_source = source
+        indexer.uses_candidates = consume is not None
+        layer = SimpleNamespace(
+            layer_id=0,
+            compress_ratio=st.ratio,
+            indexer=indexer,
+            freqs_cis=torch.zeros(4096, device=st.dev),
+        )
+        backend._low_ratio_index_topk_dense(
+            layer,
+            st.tok_ids,
+            st.tok_ids,
+            st.pos,
+            st.forward_batch,
+            st.forward_batch.extend_seq_lens,
+            st.extend_lens,
+        )
+        masks = backend.forward_metadata.candidate_metadata
+        return pages.clone(), raw.clone(), masks.request_masks if source else None
+
+    def test_chunked_source_consumer_and_tail_rows(self):
+        from sglang.srt.layers.attention import deepseek_v4_backend as impl
+
+        saved_budget = impl._DENSE_INDEXER_LOGITS_BUDGET_BYTES
+        try:
+            for ratio in (1, 2):
+                with self.subTest(ratio=ratio):
+                    st = self._setup(ratio, [700, 45, 0], [129, 45, 0])
+                    impl._DENSE_INDEXER_LOGITS_BUDGET_BYTES = 1 << 30
+                    full = self._dense(st, source=True)
+                    consumer = self._dense(st, consume=full[2])
+                    # Different widths, multiple row chunks, a partial final chunk,
+                    # underfilled top-k, and a request with no visible keys.
+                    impl._DENSE_INDEXER_LOGITS_BUDGET_BYTES = 7 * 700 * 4
+                    chunked = self._dense(st, source=True)
+                    for expected, actual in zip(full[:2], chunked[:2]):
+                        self.assertTrue(torch.equal(expected, actual))
+                    for expected, actual in zip(full[2], chunked[2]):
+                        self.assertTrue(torch.equal(expected, actual))
+                    selected = self._dense(st, consume=chunked[2])
+                    for expected, actual in zip(consumer[:2], selected[:2]):
+                        self.assertTrue(torch.equal(expected, actual))
+                    tails = [17, 3, 0]
+                    tail_only = self._dense(st, source=True, tails=tails)
+                    for expected, actual in zip(full[:2], tail_only[:2]):
+                        self.assertTrue(torch.equal(expected, actual))
+                    for mask, tail_mask, count in zip(full[2], tail_only[2], tails):
+                        self.assertEqual(tail_mask.shape[0], count)
+                        self.assertTrue(
+                            torch.equal(mask[mask.shape[0] - count :], tail_mask)
+                        )
+                    # CP metadata keeps full masks for the separate local-tail mapping.
+                    cp_masks = self._dense(st, source=True, tails=tails, cp=True)[2]
+                    for expected, actual in zip(full[2], cp_masks):
+                        self.assertTrue(torch.equal(expected, actual))
+        finally:
+            impl._DENSE_INDEXER_LOGITS_BUDGET_BYTES = saved_budget
 
 
 if __name__ == "__main__":
