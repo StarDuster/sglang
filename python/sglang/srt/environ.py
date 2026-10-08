@@ -400,6 +400,12 @@ class Envs:
     SGLANG_PYSPY_DUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH = EnvBool(True)
     SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS = EnvFloat(60.0)
+    # Collect native diagnostics once a frontend CUDA section (K3 GPU
+    # preprocessing, VMM publish/recycle) has been in flight this long.
+    # None disables the stall watchdog.
+    SGLANG_DEBUG_FRONTEND_CUDA_STALL_SECS = EnvFloat(None)
+    # None = /tmp/sglang_frontend_cuda_stall; point it at persistent storage.
+    SGLANG_DEBUG_FRONTEND_CUDA_STALL_DIR = EnvStr(None)
 
     # ===================================================================
     # Constrained decoding and grammar

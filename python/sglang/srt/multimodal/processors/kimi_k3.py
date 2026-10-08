@@ -243,7 +243,9 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
                 image_bias,
                 self._patch_size,
                 to_chw=_k3_to_cuda_chw,
-                post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+                post_resize=lambda x: _fill_transparent_bg(
+                    x, self._transparent_bg_config
+                ),
             )
 
         return {

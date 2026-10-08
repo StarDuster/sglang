@@ -12,8 +12,6 @@ from dataclasses import dataclass
 
 import torch
 
-from sglang.srt.utils.frontend_cuda_coordination import frontend_cuda_section
-
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -47,6 +45,7 @@ from sglang.srt.utils.cuda_vmm_utils import (
     release_mappings,
     tensor_from_pointer,
 )
+from sglang.srt.utils.frontend_cuda_coordination import frontend_cuda_section
 
 logger = logging.getLogger(__name__)
 
@@ -392,10 +391,12 @@ class CudaVmmMemoryPool:
                 self._publisher_condition.notify_all()
 
     def wrap_tensor(self, tensor: torch.Tensor):
-        with frontend_cuda_section():
+        with frontend_cuda_section("vmm_wrap_tensor"):
             self._raise_if_failed()
             data_nbytes = tensor.numel() * tensor.element_size()
-            required_size = align_up(self.control_size + data_nbytes, _CONTROL_ALIGNMENT)
+            required_size = align_up(
+                self.control_size + data_nbytes, _CONTROL_ALIGNMENT
+            )
 
             chunk = self._reserve_for_publish(required_size)
             if chunk is None:
@@ -464,7 +465,7 @@ class CudaVmmMemoryPool:
         ``None`` means that no contiguous pool chunk was available. No tensor is
         published in that case, so the caller can use another transport path.
         """
-        with frontend_cuda_section():
+        with frontend_cuda_section("vmm_wrap_tensors"):
             self._raise_if_failed()
             tensors = list(tensors)
             if not tensors:
@@ -505,7 +506,9 @@ class CudaVmmMemoryPool:
                             data_start = data_offset + layout.relative_offset
                             self.memory_pool[
                                 data_start : data_start + layout.data_nbytes
-                            ].copy_(tensor.reshape(-1).view(torch.uint8), non_blocking=True)
+                            ].copy_(
+                                tensor.reshape(-1).view(torch.uint8), non_blocking=True
+                            )
                     # A single synchronization publishes every child together.
                     producer_stream.synchronize()
                     copy_synchronized = True
@@ -617,7 +620,7 @@ class CudaVmmMemoryPool:
     def _recycle_chunks(self) -> None:
         # Lock order: frontend CUDA section, then short metadata-only sections.
         # Never keep the pool lock while submitting or waiting for CUDA work.
-        with frontend_cuda_section():
+        with frontend_cuda_section("vmm_recycle"):
             with self._lock:
                 chunks = tuple(self.occupied_chunks)
             if not chunks:
