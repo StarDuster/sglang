@@ -12,6 +12,8 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.srt.utils.frontend_cuda_coordination import frontend_cuda_section
+
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -390,65 +392,66 @@ class CudaVmmMemoryPool:
                 self._publisher_condition.notify_all()
 
     def wrap_tensor(self, tensor: torch.Tensor):
-        self._raise_if_failed()
-        data_nbytes = tensor.numel() * tensor.element_size()
-        required_size = align_up(self.control_size + data_nbytes, _CONTROL_ALIGNMENT)
+        with frontend_cuda_section():
+            self._raise_if_failed()
+            data_nbytes = tensor.numel() * tensor.element_size()
+            required_size = align_up(self.control_size + data_nbytes, _CONTROL_ALIGNMENT)
 
-        chunk = self._reserve_for_publish(required_size)
-        if chunk is None:
-            self._warn_pool_full_once(data_nbytes)
-            return tensor.cpu()
+            chunk = self._reserve_for_publish(required_size)
+            if chunk is None:
+                self._warn_pool_full_once(data_nbytes)
+                return tensor.cpu()
 
-        producer_stream = None
-        copy_synchronized = False
-        try:
-            with (
-                torch.cuda.device(self.device_index),
-                torch.cuda.stream(self._publish_stream),
-            ):
-                producer_stream = self._publish_stream
-                copy_source = _prepare_pinned_copy_source(tensor)
-                source_bytes = copy_source.reshape(-1).view(torch.uint8)
-                control_offset = chunk.start
-                data_offset = control_offset + self.control_size
-                control_end = control_offset + self.control_size
-                self.memory_pool[control_offset:control_end].zero_()
-                self.memory_pool[data_offset : data_offset + data_nbytes].copy_(
-                    source_bytes, non_blocking=True
-                )
-                # Imported VMM memory does not support cuStreamWaitValue32 on
-                # current GB-class drivers, so publish only after this copy.
-                producer_stream.synchronize()
-                copy_synchronized = True
-
-            proxy = CudaVmmTensorTransportProxy(
-                fabric_handle=self.fabric_handle,
-                posix_socket_path=self.posix_socket_path,
-                allocation_size=self.allocation_size,
-                data_offset=data_offset,
-                data_nbytes=data_nbytes,
-                control_offset=control_offset,
-                consumer_count=self.consumer_count,
-                shape=tensor.shape,
-                dtype=tensor.dtype,
-            )
-            with self._lock:
-                self.occupied_chunks.append(chunk)
-            return proxy
-        except BaseException:
-            safe_to_release = copy_synchronized or producer_stream is None
-            if not safe_to_release:
-                try:
+            producer_stream = None
+            copy_synchronized = False
+            try:
+                with (
+                    torch.cuda.device(self.device_index),
+                    torch.cuda.stream(self._publish_stream),
+                ):
+                    producer_stream = self._publish_stream
+                    copy_source = _prepare_pinned_copy_source(tensor)
+                    source_bytes = copy_source.reshape(-1).view(torch.uint8)
+                    control_offset = chunk.start
+                    data_offset = control_offset + self.control_size
+                    control_end = control_offset + self.control_size
+                    self.memory_pool[control_offset:control_end].zero_()
+                    self.memory_pool[data_offset : data_offset + data_nbytes].copy_(
+                        source_bytes, non_blocking=True
+                    )
+                    # Imported VMM memory does not support cuStreamWaitValue32 on
+                    # current GB-class drivers, so publish only after this copy.
                     producer_stream.synchronize()
-                    safe_to_release = True
-                except BaseException as cleanup_error:
-                    self._pool_error = cleanup_error
-            if safe_to_release:
+                    copy_synchronized = True
+
+                proxy = CudaVmmTensorTransportProxy(
+                    fabric_handle=self.fabric_handle,
+                    posix_socket_path=self.posix_socket_path,
+                    allocation_size=self.allocation_size,
+                    data_offset=data_offset,
+                    data_nbytes=data_nbytes,
+                    control_offset=control_offset,
+                    consumer_count=self.consumer_count,
+                    shape=tensor.shape,
+                    dtype=tensor.dtype,
+                )
                 with self._lock:
-                    self._release_reserved_chunk(chunk)
-            raise
-        finally:
-            self._finish_publish()
+                    self.occupied_chunks.append(chunk)
+                return proxy
+            except BaseException:
+                safe_to_release = copy_synchronized or producer_stream is None
+                if not safe_to_release:
+                    try:
+                        producer_stream.synchronize()
+                        safe_to_release = True
+                    except BaseException as cleanup_error:
+                        self._pool_error = cleanup_error
+                if safe_to_release:
+                    with self._lock:
+                        self._release_reserved_chunk(chunk)
+                raise
+            finally:
+                self._finish_publish()
 
     def wrap_tensors(
         self,
@@ -461,84 +464,85 @@ class CudaVmmMemoryPool:
         ``None`` means that no contiguous pool chunk was available. No tensor is
         published in that case, so the caller can use another transport path.
         """
-        self._raise_if_failed()
-        tensors = list(tensors)
-        if not tensors:
-            return []
+        with frontend_cuda_section():
+            self._raise_if_failed()
+            tensors = list(tensors)
+            if not tensors:
+                return []
 
-        layouts, packed_data_nbytes = _build_packed_tensor_layout(tensors)
-        required_size = align_up(
-            self.control_size + packed_data_nbytes, _CONTROL_ALIGNMENT
-        )
-        chunk = self._reserve_for_publish(required_size)
-        if chunk is None:
-            return None
-
-        producer_stream = None
-        copy_synchronized = False
-        try:
-            with (
-                torch.cuda.device(self.device_index),
-                torch.cuda.stream(self._publish_stream),
-            ):
-                producer_stream = self._publish_stream
-                packed_source = _pack_pinned_copy_sources(
-                    tensors, layouts, packed_data_nbytes
-                )
-                control_offset = chunk.start
-                data_offset = control_offset + self.control_size
-                control_end = control_offset + self.control_size
-                self.memory_pool[control_offset:control_end].zero_()
-                if packed_source is not None:
-                    self.memory_pool[
-                        data_offset : data_offset + packed_data_nbytes
-                    ].copy_(packed_source, non_blocking=True)
-                else:
-                    copy_sources = [
-                        _prepare_pinned_copy_source(tensor) for tensor in tensors
-                    ]
-                    for tensor, layout in zip(copy_sources, layouts, strict=True):
-                        data_start = data_offset + layout.relative_offset
-                        self.memory_pool[
-                            data_start : data_start + layout.data_nbytes
-                        ].copy_(tensor.reshape(-1).view(torch.uint8), non_blocking=True)
-                # A single synchronization publishes every child together.
-                producer_stream.synchronize()
-                copy_synchronized = True
-
-            owner = _CudaVmmPackedTransportOwner(
-                fabric_handle=self.fabric_handle,
-                posix_socket_path=self.posix_socket_path,
-                allocation_size=self.allocation_size,
-                data_offset=data_offset,
-                data_nbytes=packed_data_nbytes,
-                control_offset=control_offset,
-                consumer_count=self.consumer_count,
+            layouts, packed_data_nbytes = _build_packed_tensor_layout(tensors)
+            required_size = align_up(
+                self.control_size + packed_data_nbytes, _CONTROL_ALIGNMENT
             )
-            proxies = [
-                CudaVmmPackedTensorTransportProxy(
-                    owner=owner,
-                    layout=layout,
-                )
-                for layout in layouts
-            ]
-            with self._lock:
-                self.occupied_chunks.append(chunk)
-            return proxies
-        except BaseException:
-            safe_to_release = copy_synchronized or producer_stream is None
-            if not safe_to_release:
-                try:
+            chunk = self._reserve_for_publish(required_size)
+            if chunk is None:
+                return None
+
+            producer_stream = None
+            copy_synchronized = False
+            try:
+                with (
+                    torch.cuda.device(self.device_index),
+                    torch.cuda.stream(self._publish_stream),
+                ):
+                    producer_stream = self._publish_stream
+                    packed_source = _pack_pinned_copy_sources(
+                        tensors, layouts, packed_data_nbytes
+                    )
+                    control_offset = chunk.start
+                    data_offset = control_offset + self.control_size
+                    control_end = control_offset + self.control_size
+                    self.memory_pool[control_offset:control_end].zero_()
+                    if packed_source is not None:
+                        self.memory_pool[
+                            data_offset : data_offset + packed_data_nbytes
+                        ].copy_(packed_source, non_blocking=True)
+                    else:
+                        copy_sources = [
+                            _prepare_pinned_copy_source(tensor) for tensor in tensors
+                        ]
+                        for tensor, layout in zip(copy_sources, layouts, strict=True):
+                            data_start = data_offset + layout.relative_offset
+                            self.memory_pool[
+                                data_start : data_start + layout.data_nbytes
+                            ].copy_(tensor.reshape(-1).view(torch.uint8), non_blocking=True)
+                    # A single synchronization publishes every child together.
                     producer_stream.synchronize()
-                    safe_to_release = True
-                except BaseException as cleanup_error:
-                    self._pool_error = cleanup_error
-            if safe_to_release:
+                    copy_synchronized = True
+
+                owner = _CudaVmmPackedTransportOwner(
+                    fabric_handle=self.fabric_handle,
+                    posix_socket_path=self.posix_socket_path,
+                    allocation_size=self.allocation_size,
+                    data_offset=data_offset,
+                    data_nbytes=packed_data_nbytes,
+                    control_offset=control_offset,
+                    consumer_count=self.consumer_count,
+                )
+                proxies = [
+                    CudaVmmPackedTensorTransportProxy(
+                        owner=owner,
+                        layout=layout,
+                    )
+                    for layout in layouts
+                ]
                 with self._lock:
-                    self._release_reserved_chunk(chunk)
-            raise
-        finally:
-            self._finish_publish()
+                    self.occupied_chunks.append(chunk)
+                return proxies
+            except BaseException:
+                safe_to_release = copy_synchronized or producer_stream is None
+                if not safe_to_release:
+                    try:
+                        producer_stream.synchronize()
+                        safe_to_release = True
+                    except BaseException as cleanup_error:
+                        self._pool_error = cleanup_error
+                if safe_to_release:
+                    with self._lock:
+                        self._release_reserved_chunk(chunk)
+                raise
+            finally:
+                self._finish_publish()
 
     def _reserve_chunk(self, required_size: int) -> _CudaVmmMemoryChunk | None:
         candidates = [
@@ -604,47 +608,56 @@ class CudaVmmMemoryPool:
     def _recycle_loop(self) -> None:
         while not self._stop_recycler.wait(self._recycle_interval):
             try:
-                with self._lock:
-                    self._recycle_chunks()
-                    self._merge_chunks()
+                self._recycle_chunks()
             except Exception as error:
                 logger.exception("CUDA VMM multimodal pool recycle failed")
                 self._pool_error = error
                 self._stop_recycler.set()
 
     def _recycle_chunks(self) -> None:
-        if not self.occupied_chunks:
-            return
+        # Lock order: frontend CUDA section, then short metadata-only sections.
+        # Never keep the pool lock while submitting or waiting for CUDA work.
+        with frontend_cuda_section():
+            with self._lock:
+                chunks = tuple(self.occupied_chunks)
+            if not chunks:
+                return
 
-        remaining = []
-        recycled = []
-        with (
-            torch.cuda.device(self.device_index),
-            torch.cuda.stream(self._recycle_stream),
-        ):
-            acknowledgement_words = torch.stack(
-                [
-                    self.memory_pool[
-                        chunk.start : chunk.start
-                        + self.consumer_count * _CONTROL_WORD_BYTES
-                    ].view(torch.int32)
-                    for chunk in self.occupied_chunks
-                ]
-            )
-            acknowledgement_counts = (
-                torch.count_nonzero(acknowledgement_words, dim=1).cpu().tolist()
-            )
+            with (
+                torch.cuda.device(self.device_index),
+                torch.cuda.stream(self._recycle_stream),
+            ):
+                acknowledgement_words = torch.stack(
+                    [
+                        self.memory_pool[
+                            chunk.start : chunk.start
+                            + self.consumer_count * _CONTROL_WORD_BYTES
+                        ].view(torch.int32)
+                        for chunk in chunks
+                    ]
+                )
+                acknowledgement_counts = (
+                    torch.count_nonzero(acknowledgement_words, dim=1).cpu().tolist()
+                )
 
-        for chunk, acknowledgement_count in zip(
-            self.occupied_chunks, acknowledgement_counts, strict=True
-        ):
-            if acknowledgement_count == self.consumer_count:
-                recycled.append(_CudaVmmMemoryChunk(chunk.start, chunk.end))
-            else:
-                remaining.append(chunk)
-
-        self.available_chunks.extend(recycled)
-        self.occupied_chunks = remaining
+            completed = {
+                id(chunk)
+                for chunk, count in zip(chunks, acknowledgement_counts, strict=True)
+                if count == self.consumer_count
+            }
+            with self._lock:
+                remaining = []
+                for chunk in self.occupied_chunks:
+                    # Snapshot references keep their identities alive. A new
+                    # allocation at a cancelled chunk's offset has another id.
+                    if id(chunk) in completed:
+                        self.available_chunks.append(
+                            _CudaVmmMemoryChunk(chunk.start, chunk.end)
+                        )
+                    else:
+                        remaining.append(chunk)
+                self.occupied_chunks = remaining
+                self._merge_chunks()
 
     def _merge_chunks(self) -> None:
         merged = []

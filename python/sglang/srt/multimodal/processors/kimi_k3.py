@@ -61,6 +61,7 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.frontend_cuda_coordination import frontend_cuda_preprocess
 
 
 def _encode_k3_special_tokens(tokenizer, text: str) -> list[int]:
@@ -229,20 +230,21 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
             input_text, resize_configs, original_input_ids, image_sizes
         )
 
-        image_scale, image_bias = self._get_gpu_norm_tensors()
-        # Shared source-compatible batched pipeline (same as K2.5): RGBA
-        # inputs land in their own source-shape groups, and the
-        # transparent-background compositing runs on each resized batch
-        # before patchify -- identical order to the previous per-image path.
-        pixel_values, grid_thws = _gpu_preprocess_images(
-            images,
-            resize_configs,
-            image_scale,
-            image_bias,
-            self._patch_size,
-            to_chw=_k3_to_cuda_chw,
-            post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
-        )
+        with frontend_cuda_preprocess():
+            image_scale, image_bias = self._get_gpu_norm_tensors()
+            # Shared source-compatible batched pipeline (same as K2.5): RGBA
+            # inputs land in their own source-shape groups, and the
+            # transparent-background compositing runs on each resized batch
+            # before patchify -- identical order to the previous per-image path.
+            pixel_values, grid_thws = _gpu_preprocess_images(
+                images,
+                resize_configs,
+                image_scale,
+                image_bias,
+                self._patch_size,
+                to_chw=_k3_to_cuda_chw,
+                post_resize=lambda x: _fill_transparent_bg(x, self._transparent_bg_config),
+            )
 
         return {
             "input_ids": input_ids,
@@ -328,18 +330,19 @@ class KimiK3GPUProcessorWrapper(KimiGPUProcessorWrapper):
         ]
 
         if images and torch.cuda.is_available():
-            image_scale, image_bias = self._get_gpu_norm_tensors()
-            pixel_values, grid_thws = _gpu_preprocess_images(
-                images,
-                resize_configs,
-                image_scale,
-                image_bias,
-                self._patch_size,
-                to_chw=_k3_to_cuda_chw,
-                post_resize=lambda x: _fill_transparent_bg(
-                    x, self._transparent_bg_config
-                ),
-            )
+            with frontend_cuda_preprocess():
+                image_scale, image_bias = self._get_gpu_norm_tensors()
+                pixel_values, grid_thws = _gpu_preprocess_images(
+                    images,
+                    resize_configs,
+                    image_scale,
+                    image_bias,
+                    self._patch_size,
+                    to_chw=_k3_to_cuda_chw,
+                    post_resize=lambda x: _fill_transparent_bg(
+                        x, self._transparent_bg_config
+                    ),
+                )
         else:
             # The checkpoint CPU processor couples prompt composition with media
             # preprocessing. A synthetic prompt keeps that API but is discarded;
