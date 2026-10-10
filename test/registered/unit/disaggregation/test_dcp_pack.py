@@ -166,7 +166,38 @@ def _dcp_kv_manager_stub(*, page_size, kv_item_lens, num_draft_entries):
     )
 
 
+class TestDcpCollapsedDraftPlan(CustomTestCase):
+    def test_collapsed_draft_takes_the_target_rows(self):
+        # Same geometry as test_one_virtual_page_explicit_rows; rank 2 owns
+        # positions 2 and 6 -> src rows 4, 8 -> local rows 14, 15 on page 7.
+        plan = _plan(
+            src=[5, 2, 11, 4],
+            dst=[7],
+            page_size=2,
+            dcp_size=4,
+            dcp_rank=2,
+            num_kv_tokens=8,
+            draft_rows_collapsed=True,
+        )
+        self.assertEqual(plan.target_src_token_indices.tolist(), [4, 8])
+        self.assertEqual(plan.target_dst_token_indices.tolist(), [14, 15])
+        self.assertEqual(plan.draft_src_token_indices.tolist(), [4, 8])
+        self.assertEqual(plan.draft_dst_token_indices.tolist(), [14, 15])
+
+
 class TestPrepareDcpTokenItemLens(CustomTestCase):
+    def test_collapsed_draft_item_len_is_a_physical_page(self):
+        # An MLA draft under DCP stores owner rows: its page is the target's.
+        mgr = _dcp_kv_manager_stub(
+            page_size=64,
+            kv_item_lens=[64 * 32, 64 * 32, 64 * 16],
+            num_draft_entries=1,
+        )
+        token_lens = CommonKVManager.prepare_dcp_token_item_lens(
+            mgr, [64 * 32, 64 * 32, 64 * 16], dst_dcp_size=4, draft_rows_collapsed=True
+        )
+        self.assertEqual(token_lens, [32, 32, 16])
+
     def test_draft_tail_scales_by_dst_dcp_size(self):
         mgr = _dcp_kv_manager_stub(
             page_size=64,
