@@ -241,6 +241,16 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.kv_cache_dim = self.kv_lora_rank + self.qk_rope_head_dim
 
         # Runtime parameters
+        if backend == "trtllm-gen" and 64 < self.num_decode_q_heads < 128:
+            # flashinfer has no trtllm-gen MLA decode variant for this head
+            # count (e.g. a TP1 pipeline stage of a 96-head model) and would
+            # reject the multi-CTA counter buffer; run decode on cute-dsl.
+            logger.info(
+                "trtllm_mla: %d decode q heads per rank has no trtllm-gen MLA "
+                "decode kernel; using the cute-dsl runner for decode.",
+                self.num_decode_q_heads,
+            )
+            backend = "cute-dsl"
         self.backend = backend
         self.data_type = model_runner.kv_cache_dtype
         self.q_data_type = model_runner.dtype

@@ -189,6 +189,26 @@ class TestLoadDraftEmbeddingFromCheckpoint(CustomTestCase):
                 LoadConfig(load_format=LoadFormat.REMOTE_INSTANCE),
             )
 
+    def test_runai_streamer_target_on_local_checkpoint_reopens(self):
+        """runai streams local safetensors; the draft embedding re-opens them with
+        the default loader and without runai's loader-specific extra config."""
+        expected = torch.randn(VOCAB, HIDDEN)
+        with tempfile.TemporaryDirectory() as root:
+            save_file(
+                {"model.embed_tokens.weight": expected},
+                os.path.join(root, "model.safetensors"),
+            )
+            draft = _Draft()
+            param = self._load(
+                draft,
+                root,
+                LoadConfig(
+                    load_format=LoadFormat.RUNAI_STREAMER,
+                    model_loader_extra_config={"concurrency": 2},
+                ),
+            )
+        self._assert_loaded(param, expected)
+
     def test_draft_without_embedding_fails_loudly(self):
         with self.assertRaises(ValueError):
             self._load(_Draft(with_embedding=False), "/nonexistent")
