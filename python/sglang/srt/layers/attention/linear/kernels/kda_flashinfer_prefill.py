@@ -121,7 +121,11 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             g=g[:, : q.shape[1]].contiguous(),
             beta=beta[:, : q.shape[1]].contiguous(),
             A_log=A_log.reshape(-1).float().contiguous(),
-            dt_bias=dt_bias.reshape(q.shape[2], 128).float().contiguous(),
+            # recurrent_kda indexes dt_bias flat ([H*K], dt_bias[h*K + d]) and its
+            # grouped kernel marks dim 0 as the unit-stride dim; a [H, K] view
+            # fails that compile (strides[0] == K) the first time a new variant
+            # is built, mid-serving.
+            dt_bias=dt_bias.reshape(-1).float().contiguous(),
             initial_state=ssm_states,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
