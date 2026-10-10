@@ -3042,7 +3042,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         return self.model.embed_tokens
 
     def get_pp_proxy_dspark_hidden_size(self) -> int:
-        layers = self.model.dspark_layers_to_capture or []
+        # Captures banked by earlier stages ride the proxy, for DSPARK and
+        # EAGLE3 alike (capture_layer_ids is zero-based for both).
+        layers = self.model.capture_layer_ids or ()
         return self.config.hidden_size * sum(
             layer < self.model.start_layer - 1 for layer in layers
         )
@@ -3080,12 +3082,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         # One-based completed-layer ids, the draft config's convention
         # ([2, 46, 90] on the 93-layer target); the model taps the plain
         # prefix stream after those layers.
-        if self.pp_group.world_size > 1:
-            # Capture layers living on non-last PP ranks would be silently
-            # skipped, as for DSPARK.
-            raise NotImplementedError("EAGLE3 aux hidden capture requires PP=1.")
-        if not self.pp_group.is_last_rank:
-            return
+        # Every PP stage keeps the ids: earlier stages capture their layers
+        # and forward them on the proxy, as for DSPARK.
         if self.model.carries_bank_slices:
             raise RuntimeError(
                 "the model keeps each rank's shard of the rows across SP-MoE "

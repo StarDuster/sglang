@@ -2587,6 +2587,15 @@ class TestPipelineParallelCompat(CustomTestCase):
     def test_dspark_pd_prefill_does_not_require_eagle_architecture(self):
         check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
 
+    def test_eagle3_pd_prefill_relays_captures_like_dspark(self):
+        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE3"))
+
+    def test_eagle3_is_rejected_outside_pd_prefill(self):
+        with self.assertRaisesRegex(AssertionError, "EAGLE3.*prefill"):
+            check_pipeline_parallel_compat(
+                self._cfg(speculative_algorithm="EAGLE3", disaggregation_mode="null")
+            )
+
     def test_dspark_is_rejected_outside_pd_prefill(self):
         for mode in ("decode", "null"):
             with self.subTest(mode=mode):
@@ -2641,7 +2650,7 @@ class TestPipelineParallelCompat(CustomTestCase):
 
     def test_non_eagle_speculative_algorithms_are_rejected(self):
         with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):
-            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="EAGLE3"))
+            check_pipeline_parallel_compat(self._cfg(speculative_algorithm="NEXTN"))
 
     def test_multi_layer_eagle_is_rejected(self):
         with self.assertRaisesRegex(AssertionError, "only supports EAGLE"):

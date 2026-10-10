@@ -39,17 +39,18 @@ def _bare_model(*, dspark_ids=None, eagle3_ids=None):
     return model
 
 
-def _bare_lm():
+def _bare_lm(*, pp_world_size=1, is_last_rank=True, start_layer=0):
     lm = object.__new__(KimiK3LinearForCausalLM)
     nn.Module.__init__(lm)
     lm.config = SimpleNamespace(num_hidden_layers=93, hidden_size=_H)
-    lm.pp_group = _FakePPGroup()
+    lm.pp_group = _FakePPGroup(world_size=pp_world_size, is_last_rank=is_last_rank)
     lm.model = SimpleNamespace(
         eagle3_layers_to_capture=None,
         dspark_layers_to_capture=None,
         carries_bank_slices=False,
         packs_aux_hidden_states=True,
         capture_layer_ids=(1, 45, 89),
+        start_layer=start_layer,
     )
     lm.capture_aux_hidden_states = False
     return lm
@@ -104,6 +105,14 @@ class TestKimiK3Eagle3Capture(CustomTestCase):
         lm = _bare_lm()
         lm.set_eagle3_layers_to_capture([2, 46, 90])
         self.assertEqual(lm.model.eagle3_layers_to_capture, (2, 46, 90))
+
+    def test_pp_stage_keeps_ids_and_sizes_the_proxy_by_earlier_captures(self):
+        # Stage 1 of 2 starts at layer 46: it stores the ids (it must capture
+        # layer 89 itself) and expects one earlier capture (layer 1) on the proxy.
+        lm = _bare_lm(pp_world_size=2, is_last_rank=True, start_layer=46)
+        lm.set_eagle3_layers_to_capture([2, 46, 90])
+        self.assertEqual(lm.model.eagle3_layers_to_capture, (2, 46, 90))
+        self.assertEqual(lm.get_pp_proxy_dspark_hidden_size(), 1 * _H)
 
     def test_aux_width_counts_eagle3_captures(self):
         # Width must follow capture_layer_ids, not dspark_layers_to_capture (None here).
