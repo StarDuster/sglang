@@ -112,11 +112,11 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size <= 1 or not cfg.enable_hierarchical_cache:
         return
-    if cfg.speculative_algorithm not in (None, "DSPARK"):
+    if cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE3"):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK speculative "
-            "decoding; other draft-model host pools have no DCP index "
-            "translation."
+            "HiCache with --dcp-size > 1 only supports DSPARK and EAGLE3 "
+            "speculative decoding; the materialized draft pool is validated "
+            "when it is registered."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(
