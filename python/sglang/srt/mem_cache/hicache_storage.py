@@ -201,6 +201,19 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # Capability declarations belong to the implementation, never to extra_config.
+    # An opted-in plugin validates its format/namespace before client creation.
+    dcp_storage_capabilities: frozenset[str] = frozenset()
+
+    @classmethod
+    def validate_dcp_config(cls, storage_config, host_pools) -> None:
+        """Validate before native client construction or sidecar registration.
+
+        ``host_pools`` maps PoolName to actual materialized host pools. This also
+        runs for sidecars registered after startup. Raise on unsupported formats.
+        """
+        raise NotImplementedError(f"{cls.__name__} has not opted into DCP storage.")
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host

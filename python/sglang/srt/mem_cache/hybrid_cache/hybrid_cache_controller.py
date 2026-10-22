@@ -338,9 +338,6 @@ class HybridCacheController(BaseHiCacheController):
                 self.pp_prefetch_command_group = None
             raise
 
-        for entry in host_pools or []:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
-
     def detach_storage_backend(self):
         super().detach_storage_backend()
         if self.pp_prefetch_command_group is not None:
@@ -353,11 +350,26 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
-        self.mem_pool_host.add_entry(entry)
-        if not entry.is_primary_index_anchor:
-            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
+        if entry.name in self.mem_pool_host.entry_map:
+            raise ValueError(f"Host pool {entry.name} is already registered.")
+        if entry.is_primary_index_anchor:
+            raise ValueError("Cannot replace the anchor of an existing HostPoolGroup.")
         if self.enable_storage and self.storage_backend is not None:
+            from sglang.srt.mem_cache.storage import StorageBackendFactory
+
+            pools = self._storage_host_pools()
+            pools[entry.name] = entry.host_pool
+            StorageBackendFactory.validate_backend(
+                self.storage_backend_type,
+                self.storage_config,
+                pools,
+                backend_class=type(self.storage_backend),
+            )
+            # A failed native registration must not publish the new sidecar to
+            # the controller, its transfer map, or its release queues.
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+        self.mem_pool_host.add_entry(entry)
+        self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
 
     @staticmethod
     def parse_storage_backend_extra_config(
