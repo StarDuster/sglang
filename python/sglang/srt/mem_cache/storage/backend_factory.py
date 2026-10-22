@@ -135,8 +135,12 @@ class StorageBackendFactory:
                 conf["module_path"], conf["class_name"], conf["backend_name"]
             )
         capabilities = backend_class.dcp_storage_capabilities
-        if not isinstance(capabilities, frozenset):
-            raise TypeError("dcp_storage_capabilities must be a frozenset of names.")
+        if not isinstance(capabilities, frozenset) or any(
+            not isinstance(name, str) or not name for name in capabilities
+        ):
+            raise TypeError(
+                "dcp_storage_capabilities must be a frozenset of nonempty names."
+            )
         if dcp:
             required = {"mla_sharded", "logical_page_indices"}
             if PoolName.MAMBA in host_pools:
