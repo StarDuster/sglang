@@ -201,6 +201,35 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # Dynamic implementations opt into DCP through class-level capabilities:
+    # - mla_sharded: identify each MLA object by its DCP shard.
+    # - logical_page_indices: accept logical host indices for physical MLA pages.
+    # - mamba_tp_sharded: preserve rank-local Mamba state identity.
+    # - exact_restorable_prefix_pages: report exact sparse checkpoint positions
+    #   through PoolTransferResult.restorable_prefix_pages for rank intersection.
+    # - draft_mla_sharded: apply MLA shard/page semantics to the draft sidecar.
+    # Extra configuration cannot grant these implementation capabilities.
+    dcp_storage_capabilities: frozenset[str] = frozenset()
+
+    # Plugins owning registered host memory may opt into strict cleanup. Their
+    # close() must unregister it and be retryable; a failure retains the backend
+    # and its pool references, blocks reattachment, and propagates to the caller.
+    # Legacy backends retain their existing best-effort close behavior.
+    requires_explicit_memory_cleanup: bool = False
+
+    @classmethod
+    def validate_dcp_config(cls, storage_config, host_pools) -> None:
+        """Validate before native client construction or sidecar registration.
+
+        ``host_pools`` maps PoolName to actual materialized host pools. This also
+        runs for sidecars registered after startup. Validate the implementation's
+        object identity, topology, layout and page format; reject incompatible
+        configurations without opening clients or registering memory. Opted-in
+        implementations are also validated at DCP1. The empty default preserves
+        legacy dynamic plugins at DCP1 and rejects them at DCP > 1.
+        """
+        raise NotImplementedError(f"{cls.__name__} has not opted into DCP storage.")
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host

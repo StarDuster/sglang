@@ -529,6 +529,13 @@ class HiCacheController:
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
 
+    def _storage_host_pools(self):
+        """Actual pool map shared by startup, runtime attach and late sidecars."""
+        if self.mem_pool_host is self.storage_host_pool:
+            return {PoolName.KV: self.storage_host_pool}
+        pools = {entry.name: entry.host_pool for entry in self.mem_pool_host.entries}
+        return pools
+
     def attach_storage_backend(
         self,
         storage_backend: str,
@@ -541,15 +548,23 @@ class HiCacheController:
         Requirement: no in-flight requests. This call is expected to run on the scheduler
         thread (control path), not concurrently with prefetch/backup.
         """
+        if getattr(
+            getattr(self, "storage_backend", None),
+            "requires_explicit_memory_cleanup",
+            False,
+        ):
+            raise RuntimeError(
+                "Storage backend still retained; detach must finish before attaching."
+            )
         if self.enable_storage:
             raise RuntimeError("Storage backend already attached.")
         if get_parallel().attn_dcp_size > 1:
             from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-            if storage_backend not in ("file", "mooncake"):
+            if storage_backend not in ("file", "mooncake", "dynamic"):
                 raise NotImplementedError(
-                    "HiCache L3 with DCP requires file or Mooncake storage."
+                    "HiCache L3 with DCP requires file, Mooncake, or a validated dynamic backend."
                 )
             if (
                 not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)
@@ -561,13 +576,21 @@ class HiCacheController:
             if self.mem_pool_host is not self.storage_host_pool and any(
                 entry.host_pool is not self.storage_host_pool
                 and (
-                    entry.name != PoolName.MAMBA
-                    or not isinstance(entry.host_pool, MambaPoolHost)
+                    not (
+                        entry.name == PoolName.MAMBA
+                        and isinstance(entry.host_pool, MambaPoolHost)
+                    )
+                    and not (
+                        storage_backend == "dynamic"
+                        and entry.name == PoolName.DRAFT
+                        and isinstance(entry.host_pool, MLATokenToKVPoolHost)
+                    )
                 )
                 for entry in self.mem_pool_host.entries
             ):
                 raise NotImplementedError(
-                    "HiCache L3 with DCP supports only MLA KV and optional KDA state."
+                    "HiCache L3 with DCP supports MLA KV, KDA state, and "
+                    "validated dynamic MLA draft pools."
                 )
             if self.storage_host_pool.layout not in (
                 "layer_first",
@@ -609,9 +632,19 @@ class HiCacheController:
 
         try:
             self.storage_backend = StorageBackendFactory.create_backend(
-                storage_backend, self.storage_config, self.storage_host_pool
+                storage_backend,
+                self.storage_config,
+                self.storage_host_pool,
+                storage_host_pools=self._storage_host_pools(),
             )
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
+            if self.mem_pool_host is not self.storage_host_pool:
+                # Register every validated sidecar before starting any I/O thread.
+                # Failures stay inside the normal attach rollback path.
+                for entry in self.mem_pool_host.entries:
+                    self.storage_backend.register_mem_host_pool_v2(
+                        entry.host_pool, entry.name
+                    )
 
             self.enable_storage = True
             # todo: threshold policy for prefetching
@@ -678,8 +711,16 @@ class HiCacheController:
                 ):
                     if hasattr(self.storage_backend, "close"):
                         self.storage_backend.close()
-            except Exception:
-                pass
+            except Exception as close_error:
+                if getattr(
+                    self.storage_backend, "requires_explicit_memory_cleanup", False
+                ):
+                    self.enable_storage = False
+                    self.page_get_func = self._generic_page_get
+                    self.page_set_func = self._generic_page_set
+                    raise RuntimeError(
+                        "Storage backend cleanup failed; backend retained for detach retry."
+                    ) from close_error
             self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
@@ -722,8 +763,17 @@ class HiCacheController:
                 and hasattr(self.storage_backend, "close")
             ):
                 self.storage_backend.close()
-        except Exception:
+        except Exception as close_error:
             logger.exception("Failed to close storage backend cleanly.")
+            if getattr(
+                self.storage_backend, "requires_explicit_memory_cleanup", False
+            ):
+                self.enable_storage = False
+                self.page_get_func = self._generic_page_get
+                self.page_set_func = self._generic_page_set
+                raise RuntimeError(
+                    "Storage backend cleanup failed; backend retained for detach retry."
+                ) from close_error
 
         self.storage_backend = None
         self.storage_backend_type = None

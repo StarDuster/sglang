@@ -41,6 +41,7 @@ class StorageAttachment:
 
     def __init__(self, cache: UnifiedRadixCache):
         self._cache = cache
+        self._cleanup_pending = False
 
     # ---- Lifecycle entry points ----
 
@@ -74,6 +75,12 @@ class StorageAttachment:
                 "HiCache is not initialized (no cache controller); "
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
+
+        if self._cleanup_pending or (
+            not controller.enable_storage
+            and getattr(controller, "storage_backend", None) is not None
+        ):
+            return False, "HiCache storage cleanup is pending; retry detach first."
 
         # Write-back can retain auxiliary host rows without FULL, or backed
         # descendants below an unbacked FULL ancestor. Those states are invalid
@@ -196,6 +203,7 @@ class StorageAttachment:
         if controller is None:
             return False, "HiCache storage backend is not initialized."
 
+        self._cleanup_pending = True
         try:
             cache.drain_storage_control_queues_local()
             # Idempotent: ask the controller to clean up even when `enable_storage`
@@ -204,19 +212,24 @@ class StorageAttachment:
             controller.detach_storage_backend()
         except Exception as e:
             logger.exception("Failed to detach storage backend.")
-            # Never crash the server for an admin operation. The controller raises
-            # while its threads are still alive, so leave `ongoing_*` untouched --
-            # a retry must still be able to match their acks.
+            # A thread-stop failure leaves storage enabled; a strict close failure
+            # leaves it stopped with the backend retained. Mirror that distinction
+            # without discarding bookkeeping needed by the next detach attempt.
+            if not controller.enable_storage:
+                cache.enable_storage = False
+                cache.enable_storage_metrics = False
             return False, f"Failed to detach HiCache storage backend: {e}"
-
-        try:
-            self._release_pending_storage_ops()
-            cache.drain_storage_control_queues_local()
-        except Exception:
-            logger.exception("Failed post-detach cleanup of storage bookkeeping.")
 
         cache.enable_storage = False
         cache.enable_storage_metrics = False
+        try:
+            self._release_pending_storage_ops()
+            cache.drain_storage_control_queues_local()
+        except Exception as e:
+            logger.exception("Failed post-detach cleanup of storage bookkeeping.")
+            return False, f"HiCache storage stopped; bookkeeping cleanup failed: {e}"
+
+        self._cleanup_pending = False
         return True, "Detached HiCache storage backend successfully."
 
     def shutdown(self) -> None:
@@ -226,7 +239,12 @@ class StorageAttachment:
         via CLI args or via the admin API is detached on exit.
         """
         try:
-            if self._cache.enable_storage:
+            controller = self._cache.cache_controller
+            if (
+                self._cache.enable_storage
+                or self._cleanup_pending
+                or getattr(controller, "storage_backend", None) is not None
+            ):
                 self.detach()
         except Exception:
             logger.exception("Failed to detach storage backend on process shutdown.")
@@ -411,6 +429,7 @@ class StorageAttachment:
         """
         cache = self._cache
         controller = cache.cache_controller
+        failures = 0
 
         for handle in list(cache.ongoing_prefetch):
             info = cache.ongoing_prefetch[handle]
@@ -432,14 +451,22 @@ class StorageAttachment:
                 )
             except Exception:
                 logger.exception("Failed to release pending prefetch %s", handle.rid)
-                cache.ongoing_prefetch.pop(handle, None)
+                failures += 1
 
         for ack_id in list(cache.ongoing_backup):
-            node_id, lock_params = cache.ongoing_backup.pop(ack_id)
+            node_id, lock_params = cache.ongoing_backup[ack_id]
             try:
                 cache.dec_host_lock_ref(node_id, lock_params)
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
+                failures += 1
+            else:
+                cache.ongoing_backup.pop(ack_id)
+
+        if failures:
+            raise RuntimeError(
+                f"Failed to release {failures} pending storage operations"
+            )
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
             cache.discard_storage_prefetch_accounting(handle)
